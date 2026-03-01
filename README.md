@@ -12,7 +12,7 @@
 * [快速上手](#快速上手)
 
   * [环境与依赖](#环境与依赖)
-  * [准备 Tushare Token](#准备-tushare-token)
+  * [准备 .env（Tushare Token）](#准备-envtushare-token)
   * [准备 stocklist.csv](#准备-stocklistcsv)
   * [下载历史 K 线（qfq，日线）](#下载历史-k-线qfq日线)
   * [运行选股](#运行选股)
@@ -30,6 +30,7 @@
   * [5. MA60CrossVolumeWaveSelector（上穿60放量战法）](#5-ma60crossvolumewaveselector上穿60放量战法)
   * [6. BigBullishVolumeSelector（暴力K战法）](#6-bigbullishvolumeselector暴力k战法)
 
+* [策略流程图（Mermaid）](#策略流程图mermaid)
 * [项目结构](#项目结构)
 * [常见问题](#常见问题)
 * [免责声明](#免责声明)
@@ -42,7 +43,7 @@
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`fetch_kline.py`**  | 仅使用 **Tushare** 抓取 **A 股日线（前复权 qfq）**。**股票池从 `stocklist.csv` 读取**，支持排除 **创业板/科创板/北交所**，并发抓取，**每次运行全量覆盖保存**（不做增量合并），输出 CSV 列：`date, open, close, high, low, volume`。 |
 | **`select_stock.py`** | 加载 `./data` 目录内 CSV 行情与 `configs.json`，批量执行选择器（Selector）并输出结果到控制台与 `select_results.log`。                                                                                           |
-| **`Selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 5 个策略，统一纳入“当日过滤 & 知行约束”。                                                                                                                           |
+| **`Selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 6 个策略，统一纳入“当日过滤 & 知行约束”。                                                                                                                           |
 
 ---
 
@@ -51,30 +52,40 @@
 ### 环境与依赖
 
 ```bash
-# Python 3.11/3.12 均可，示例以 3.12
-conda create -n stock python=3.12 -y
-conda activate stock
-
 # 进入你的项目目录
 cd /path/to/your/project
 
+# Python 3.11/3.12 均可，示例以系统 python3
+python3 -m venv .venv
+
+# macOS / Linux 激活
+source .venv/bin/activate
+
+# Windows (PowerShell) 激活
+# .venv\Scripts\Activate.ps1
+
+# 升级 pip（可选）
+python -m pip install --upgrade pip
+
 # 安装依赖
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 > 关键依赖：`pandas`, `tqdm`, `tushare`, `numpy`, `scipy`。
 
-### 准备 Tushare Token
+### 准备 .env（Tushare Token）
 
-1. 在系统环境中写入 `TUSHARE_TOKEN`：
+1. 在项目根目录创建 `.env` 文件并写入：
 
 ```bash
-# Windows (PowerShell)
-setx TUSHARE_TOKEN "你的token"
+# 可选：先复制模板
+cp .env.example .env
 
-# macOS / Linux (bash)
-export TUSHARE_TOKEN=你的token
+# 编辑 .env，填入你的 token
+TUSHARE_TOKEN=你的token
 ```
+
+> `fetch_kline.py` 默认会读取 `./.env`。如需使用其它路径，可传 `--env-file /path/to/.env`。
 
 ### 下载历史 K 线（qfq，日线）
 
@@ -115,6 +126,7 @@ python select_stock.py \
 | `--end`            | `today`           | 结束日期，格式同上                                                                  |
 | `--stocklist`      | `./stocklist.csv` | 股票清单 CSV 路径（含 `ts_code` 或 `symbol`）                                        |
 | `--exclude-boards` | `[]`              | 排除板块，枚举：`gem`(创业板 300/301) / `star`(科创板 688) / `bj`(北交所 .BJ / 4/8 开头)。可多选。 |
+| `--env-file`       | `./.env`          | `.env` 文件路径（读取 `TUSHARE_TOKEN`）                                              |
 | `--out`            | `./data`          | 输出目录（自动创建）                                                                 |
 | `--workers`        | `6`               | 并发线程数                                                                      |
 
@@ -343,7 +355,98 @@ python select_stock.py \
     "vol_multiple": 2.5
   }
 }
+```
 
+
+---
+
+## 策略流程图（Mermaid）
+
+### 1. BBIKDJSelector（少妇战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[计算 BBI]
+    B --> C[统一当日过滤]
+    C --> D[收盘波动约束 max_window]
+    D --> E[BBI 导数趋势通过]
+    E --> F[KDJ 低位过滤]
+    F --> G[MA60 条件 今日在 MA60 上方且存在有效上穿]
+    G --> H[MACD DIF > 0]
+    H --> I[知行条件 close>长期线 且 短线>长线]
+    I --> J[入选]
+```
+
+### 2. SuperB1Selector（SuperB1战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[统一当日过滤]
+    B --> C[历史长度检查]
+    C --> D[回溯寻找 t_m 满足 BBIKDJ]
+    D --> E[盘整区间波动 <= close_vol_pct]
+    E --> F[t_m 当日知行条件]
+    F --> G[当日相对前一日下跌 >= price_drop_pct]
+    G --> H[KDJ 低位过滤]
+    H --> I[当日只要求短线>长线]
+    I --> J[入选]
+```
+
+### 3. BBIShortLongSelector（补票战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[计算 BBI]
+    B --> C[统一当日过滤]
+    C --> D[BBI 导数趋势通过]
+    D --> E[计算短长 RSV]
+    E --> F[最近 m 日结构通过]
+    F --> G[MACD DIF > 0]
+    G --> H[知行条件 close>长期线 且 短线>长线]
+    H --> I[入选]
+```
+
+### 4. PeakKDJSelector（填坑战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[统一当日过滤]
+    B --> C[计算 oc_max=max(open,close)]
+    C --> D[提取峰值并排除当日]
+    D --> E[寻找有效参照峰 peak_(t-n)]
+    E --> F[当日收盘与参照峰波动 <= fluc_threshold]
+    F --> G[KDJ 低位过滤]
+    G --> H[知行条件 close>长期线 且 短线>长线]
+    H --> I[入选]
+```
+
+### 5. MA60CrossVolumeWaveSelector（上穿60放量战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[长度检查]
+    B --> C[统一当日过滤]
+    C --> D[KDJ 低位过滤]
+    D --> E[MA60 条件 今日在 MA60 上方且最近有有效上穿]
+    E --> F[取上穿日 T 到 Tmax 的上涨波段]
+    F --> G[波段均量 >= vol_multiple x 前置窗口均量]
+    G --> H[MA60 回归斜率 > 0]
+    H --> I[知行条件 close>长期线 且 短线>长线]
+    I --> J[入选]
+```
+
+### 6. BigBullishVolumeSelector（暴力K战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[长度和 OHLCV 合法性检查]
+    B --> C[可选 收阳约束 close>=open]
+    C --> D[长阳 涨幅 > up_pct_threshold]
+    D --> E[上影线比例 < upper_wick_pct_max]
+    E --> F[放量 vT >= vol_multiple x 前 n 日均量]
+    F --> G[不过热 close < ZXDQ x close_lt_zxdq_mult]
+    G --> H[入选]
+```
 
 ---
 
@@ -351,6 +454,7 @@ python select_stock.py \
 
 ```
 .
+├── .env.example             # Token 配置模板（复制为 .env 后填写）
 ├── configs.json             # 选择器参数（示例见上文）
 ├── fetch_kline.py           # 从 stocklist.csv 读取并抓取 Tushare 日线（qfq）
 ├── select_stock.py          # 批量选股入口

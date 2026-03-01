@@ -60,6 +60,32 @@ def set_api(session) -> None:
     """由外部(比如GUI)注入已创建好的 ts.pro_api() 会话"""
     global pro
     pro = session
+
+
+def load_env_file(env_file: Path) -> None:
+    """
+    从 .env 文件加载键值对到环境变量。
+    - 支持 `KEY=VALUE` 与 `export KEY=VALUE`
+    - 已存在于系统环境中的键不覆盖
+    """
+    if not env_file.exists():
+        return
+
+    for raw in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if key and key not in os.environ:
+            os.environ[key] = value
     
 
 def _to_ts_code(code: str) -> str:
@@ -184,17 +210,21 @@ def main():
         choices=["gem", "star", "bj"],
         help="排除板块，可多选：gem(创业板300/301) star(科创板688) bj(北交所.BJ/4/8)"
     )
+    parser.add_argument("--env-file", type=Path, default=Path("./.env"), help=".env 文件路径（默认 ./.env）")
     # 其它
     parser.add_argument("--out", default="./data", help="输出目录")
     parser.add_argument("--workers", type=int, default=6, help="并发线程数")
     args = parser.parse_args()
 
     # ---------- Tushare Token ---------- #
+    load_env_file(args.env_file)
     os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
     os.environ["no_proxy"] = os.environ["NO_PROXY"]
     ts_token = os.environ.get("TUSHARE_TOKEN")
     if not ts_token:
-        raise ValueError("请先设置环境变量 TUSHARE_TOKEN，例如：export TUSHARE_TOKEN=你的token")
+        raise ValueError(
+            f"未读取到 TUSHARE_TOKEN。请在 {args.env_file} 中配置，例如：TUSHARE_TOKEN=你的token"
+        )
     ts.set_token(ts_token)
     global pro
     pro = ts.pro_api()
