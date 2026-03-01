@@ -7,8 +7,10 @@ import random
 import sys
 import time
 import warnings
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import List, Optional
 import os
 
@@ -55,6 +57,38 @@ def _cool_sleep(base_seconds: int) -> None:
 
 # --------------------------- 历史K线（Tushare 日线，固定qfq） --------------------------- #
 pro: Optional[ts.pro_api] = None  # 模块级会话
+KLINE_COLUMNS = ["date", "open", "close", "high", "low", "volume"]
+request_limiter: Optional["MinuteRateLimiter"] = None
+
+
+class MinuteRateLimiter:
+    """全局分钟级限流器：控制所有线程总请求数 <= max_calls / 60秒。"""
+
+    def __init__(self, max_calls: int, window_seconds: float = 60.0) -> None:
+        if max_calls < 1:
+            raise ValueError("max_calls 必须 >= 1")
+        self.max_calls = int(max_calls)
+        self.window_seconds = float(window_seconds)
+        self._calls: deque[float] = deque()
+        self._lock = Lock()
+
+    def acquire(self) -> None:
+        while True:
+            wait_s = 0.0
+            with self._lock:
+                now = time.monotonic()
+                cutoff = now - self.window_seconds
+                while self._calls and self._calls[0] <= cutoff:
+                    self._calls.popleft()
+
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return
+
+                wait_s = self._calls[0] + self.window_seconds - now
+
+            if wait_s > 0:
+                time.sleep(wait_s)
 
 def set_api(session) -> None:
     """由外部(比如GUI)注入已创建好的 ts.pro_api() 会话"""
@@ -99,6 +133,8 @@ def _to_ts_code(code: str) -> str:
         return f"{code}.SZ"
 
 def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
+    if request_limiter is not None:
+        request_limiter.acquire()
     ts_code = _to_ts_code(code)
     try:
         df = ts.pro_bar(
@@ -117,9 +153,7 @@ def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    df = df.rename(columns={"trade_date": "date", "vol": "volume"})[
-        ["date", "open", "close", "high", "low", "volume"]
-    ].copy()
+    df = df.rename(columns={"trade_date": "date", "vol": "volume"})[KLINE_COLUMNS].copy()
     df["date"] = pd.to_datetime(df["date"])
     for c in ["open", "close", "high", "low", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -134,6 +168,30 @@ def validate(df: pd.DataFrame) -> pd.DataFrame:
     if (df["date"] > pd.Timestamp.today()).any():
         raise ValueError("数据包含未来日期，可能抓取错误！")
     return df
+
+
+def _load_existing_kline(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+    try:
+        old_df = pd.read_csv(csv_path, parse_dates=["date"])
+    except Exception as e:
+        logger.warning("%s 读取失败，将按空文件处理并重建：%s", csv_path.name, e)
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+
+    if any(col not in old_df.columns for col in KLINE_COLUMNS):
+        logger.warning("%s 列结构异常，将按空文件处理并重建。", csv_path.name)
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+
+    old_df = old_df[KLINE_COLUMNS].copy()
+    for c in ["open", "close", "high", "low", "volume"]:
+        old_df[c] = pd.to_numeric(old_df[c], errors="coerce")
+
+    try:
+        return validate(old_df)
+    except Exception as e:
+        logger.warning("%s 历史数据校验失败，将按空文件处理并重建：%s", csv_path.name, e)
+        return pd.DataFrame(columns=KLINE_COLUMNS)
 
 # --------------------------- 读取 stocklist.csv & 过滤板块 --------------------------- #
 
@@ -166,7 +224,7 @@ def load_codes_from_stocklist(stocklist_csv: Path, exclude_boards: set[str]) -> 
                 stocklist_csv, len(codes), ",".join(sorted(exclude_boards)) or "无")
     return codes
 
-# --------------------------- 单只抓取（全量覆盖保存） --------------------------- #
+# --------------------------- 单只抓取（增量更新，保留历史） --------------------------- #
 def fetch_one(
     code: str,
     start: str,
@@ -174,15 +232,39 @@ def fetch_one(
     out_dir: Path,
 ):
     csv_path = out_dir / f"{code}.csv"
+    start_ts = pd.to_datetime(start, format="%Y%m%d", errors="raise")
+    end_ts = pd.to_datetime(end, format="%Y%m%d", errors="raise")
+
+    if start_ts > end_ts:
+        logger.error("%s 日期区间无效：start=%s 大于 end=%s", code, start, end)
+        return
 
     for attempt in range(1, 4):
         try:
-            new_df = _get_kline_tushare(code, start, end)
-            if new_df.empty:
-                logger.debug("%s 无数据，生成空表。", code)
-                new_df = pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
-            new_df = validate(new_df)
-            new_df.to_csv(csv_path, index=False)  # 直接覆盖保存
+            old_df = _load_existing_kline(csv_path)
+
+            fetch_start_ts = start_ts
+            if not old_df.empty:
+                last_dt = old_df["date"].max().normalize()
+                fetch_start_ts = max(start_ts, last_dt + pd.Timedelta(days=1))
+
+            if fetch_start_ts > end_ts:
+                logger.debug("%s 已是最新，无需新增（本地最后日期：%s）", code, old_df["date"].max().date() if not old_df.empty else "无")
+                merged_df = old_df
+            else:
+                fetch_start = fetch_start_ts.strftime("%Y%m%d")
+                new_df = _get_kline_tushare(code, fetch_start, end)
+                if new_df.empty:
+                    logger.debug("%s 在区间 %s~%s 无新增数据。", code, fetch_start, end)
+                    merged_df = old_df
+                else:
+                    new_df = validate(new_df)
+                    merged_df = pd.concat([old_df, new_df], ignore_index=True)
+
+            if merged_df.empty:
+                merged_df = pd.DataFrame(columns=KLINE_COLUMNS)
+            merged_df = validate(merged_df)
+            merged_df.to_csv(csv_path, index=False)
             break
         except Exception as e:
             if _looks_like_ip_ban(e):
@@ -197,7 +279,7 @@ def fetch_one(
 
 # --------------------------- 主入口 --------------------------- #
 def main():
-    parser = argparse.ArgumentParser(description="从 stocklist.csv 读取股票池并用 Tushare 抓取日线K线（固定qfq，全量覆盖）")
+    parser = argparse.ArgumentParser(description="从 stocklist.csv 读取股票池并用 Tushare 抓取日线K线（固定qfq，增量更新）")
     # 抓取范围
     parser.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD 或 'today'")
     parser.add_argument("--end", default="today", help="结束日期 YYYYMMDD 或 'today'")
@@ -214,6 +296,7 @@ def main():
     # 其它
     parser.add_argument("--out", default="./data", help="输出目录")
     parser.add_argument("--workers", type=int, default=6, help="并发线程数")
+    parser.add_argument("--max-requests-per-minute", type=int, default=50, help="全局请求限频（每分钟总请求数）")
     args = parser.parse_args()
 
     # ---------- Tushare Token ---------- #
@@ -228,6 +311,8 @@ def main():
     ts.set_token(ts_token)
     global pro
     pro = ts.pro_api()
+    global request_limiter
+    request_limiter = MinuteRateLimiter(args.max_requests_per_minute)
 
     # ---------- 日期解析 ---------- #
     start = dt.date.today().strftime("%Y%m%d") if str(args.start).lower() == "today" else args.start
@@ -245,11 +330,11 @@ def main():
         sys.exit(1)
 
     logger.info(
-        "开始抓取 %d 支股票 | 数据源:Tushare(日线,qfq) | 日期:%s → %s | 排除:%s",
-        len(codes), start, end, ",".join(sorted(exclude_boards)) or "无",
+        "开始抓取 %d 支股票 | 数据源:Tushare(日线,qfq) | 模式:增量更新 | 日期:%s → %s | 排除:%s | 限频:%d次/分钟",
+        len(codes), start, end, ",".join(sorted(exclude_boards)) or "无", args.max_requests_per_minute,
     )
 
-    # ---------- 多线程抓取（全量覆盖） ---------- #
+    # ---------- 多线程抓取（增量更新） ---------- #
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(
