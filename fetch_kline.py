@@ -8,14 +8,15 @@ import sys
 import time
 import warnings
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from threading import Lock
-from typing import List, Optional
+from typing import Any, List, Optional, cast
 import os
 
 import pandas as pd
 import tushare as ts
+from tushare.pro.client import DataApi
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
@@ -37,10 +38,14 @@ def _patch_pandas_fillna_method_compat() -> None:
 
     from pandas.core.generic import NDFrame
 
-    if getattr(NDFrame.fillna, "__name__", "") == "_compat_fillna_with_method":
+    fillna_attr = cast(Any, getattr(NDFrame, "fillna", None))
+    if fillna_attr is None:
         return
 
-    _orig_fillna = NDFrame.fillna
+    if getattr(fillna_attr, "__name__", "") == "_compat_fillna_with_method":
+        return
+
+    _orig_fillna = fillna_attr
 
     def _compat_fillna_with_method(
         self,
@@ -64,7 +69,7 @@ def _patch_pandas_fillna_method_compat() -> None:
             raise TypeError("fillna() missing required argument: 'value'")
         return _orig_fillna(self, value=value, axis=axis, inplace=inplace, limit=limit, **kwargs)
 
-    NDFrame.fillna = _compat_fillna_with_method
+    setattr(NDFrame, "fillna", _compat_fillna_with_method)
     logging.getLogger("fetch_from_stocklist").warning(
         "检测到 pandas %s，已启用 fillna(method=...) 兼容补丁（用于 tushare）。",
         pd.__version__,
@@ -91,12 +96,30 @@ BAN_PATTERNS = (
     "访问频繁", "请稍后", "超过频率", "频繁访问",
     "too many requests", "429",
     "forbidden", "403",
-    "max retries exceeded"
+)
+NETWORK_RETRY_PATTERNS = (
+    "name resolution",
+    "failed to resolve",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+    "newconnectionerror",
+    "connection aborted",
+    "connection reset",
+    "read timed out",
+    "connect timeout",
+    "max retries exceeded",
 )
 
 def _looks_like_ip_ban(exc: Exception) -> bool:
     msg = (str(exc) or "").lower()
+    if any(pat in msg for pat in NETWORK_RETRY_PATTERNS):
+        return False
     return any(pat in msg for pat in BAN_PATTERNS)
+
+
+def _looks_like_transient_network(exc: Exception) -> bool:
+    msg = (str(exc) or "").lower()
+    return any(pat in msg for pat in NETWORK_RETRY_PATTERNS)
 
 class RateLimitError(RuntimeError):
     """表示命中限流/封禁，需要长时间冷却后重试。"""
@@ -109,7 +132,7 @@ def _cool_sleep(base_seconds: int) -> None:
     time.sleep(sleep_s)
 
 # --------------------------- 历史K线（Tushare 日线，固定qfq） --------------------------- #
-pro: Optional[ts.pro_api] = None  # 模块级会话
+pro: Optional[DataApi] = None  # 模块级会话
 KLINE_COLUMNS = ["date", "open", "close", "high", "low", "volume"]
 request_limiter: Optional["MinuteRateLimiter"] = None
 
@@ -124,6 +147,7 @@ class MinuteRateLimiter:
         self.window_seconds = float(window_seconds)
         self._calls: deque[float] = deque()
         self._lock = Lock()
+        self._last_wait_log_monotonic = 0.0
 
     def acquire(self) -> None:
         while True:
@@ -139,9 +163,34 @@ class MinuteRateLimiter:
                     return
 
                 wait_s = self._calls[0] + self.window_seconds - now
+                if wait_s > 3 and now - self._last_wait_log_monotonic >= 20:
+                    logger.info(
+                        "触发全局限频：窗口内 %d/%d 次请求，预计等待 %.2f 秒",
+                        len(self._calls),
+                        self.max_calls,
+                        wait_s,
+                    )
+                    self._last_wait_log_monotonic = now
 
             if wait_s > 0:
                 time.sleep(wait_s)
+
+    def snapshot(self) -> dict[str, float | int]:
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            while self._calls and self._calls[0] <= cutoff:
+                self._calls.popleft()
+            calls_in_window = len(self._calls)
+            if calls_in_window < self.max_calls:
+                wait_s = 0.0
+            else:
+                wait_s = max(0.0, self._calls[0] + self.window_seconds - now)
+            return {
+                "calls_in_window": calls_in_window,
+                "max_calls": self.max_calls,
+                "estimated_wait_s": wait_s,
+            }
 
 def set_api(session) -> None:
     """由外部(比如GUI)注入已创建好的 ts.pro_api() 会话"""
@@ -327,7 +376,15 @@ def fetch_one(
                 _cool_sleep(COOLDOWN_SECS)
             else:
                 silent_seconds = 15 * attempt
-                logger.info(f"{code} 第 {attempt} 次抓取失败，{silent_seconds} 秒后重试：{e}")
+                level = logger.warning if _looks_like_transient_network(e) else logger.info
+                level(
+                    "%s 第 %d 次抓取失败，%d 秒后重试 [%s]：%s",
+                    code,
+                    attempt,
+                    silent_seconds,
+                    type(e).__name__,
+                    e,
+                )
                 time.sleep(silent_seconds)
     else:
         logger.error("%s 三次抓取均失败，已跳过！", code)
@@ -352,6 +409,7 @@ def main():
     parser.add_argument("--out", default="./data", help="输出目录")
     parser.add_argument("--workers", type=int, default=6, help="并发线程数")
     parser.add_argument("--max-requests-per-minute", type=int, default=50, help="全局请求限频（每分钟总请求数）")
+    parser.add_argument("--heartbeat-seconds", type=int, default=30, help="无完成任务时的心跳日志间隔（秒）")
     args = parser.parse_args()
 
     # ---------- Tushare Token ---------- #
@@ -396,7 +454,7 @@ def main():
 
     # ---------- 多线程抓取（增量更新） ---------- #
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = [
+        pending = {
             executor.submit(
                 fetch_one,
                 code,
@@ -405,9 +463,43 @@ def main():
                 out_dir,
             )
             for code in codes
-        ]
-        for _ in tqdm(as_completed(futures), total=len(futures), desc="下载进度"):
-            pass
+        }
+        heartbeat_s = max(5, int(args.heartbeat_seconds))
+        last_heartbeat = time.monotonic()
+        total = len(pending)
+        with tqdm(total=total, desc="下载进度") as pbar:
+            while pending:
+                done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                if done:
+                    pbar.update(len(done))
+                    for fut in done:
+                        exc = fut.exception()
+                        if exc is not None:
+                            logger.error("工作线程出现未处理异常：%s: %s", type(exc).__name__, exc)
+                    last_heartbeat = time.monotonic()
+                    continue
+
+                now = time.monotonic()
+                if now - last_heartbeat >= heartbeat_s:
+                    if request_limiter is not None:
+                        limiter_state = request_limiter.snapshot()
+                        logger.info(
+                            "抓取心跳：已完成 %d/%d，剩余 %d；限频窗口 %d/%d，预计等待 %.2f 秒",
+                            pbar.n,
+                            total,
+                            len(pending),
+                            int(limiter_state["calls_in_window"]),
+                            int(limiter_state["max_calls"]),
+                            float(limiter_state["estimated_wait_s"]),
+                        )
+                    else:
+                        logger.info(
+                            "抓取心跳：已完成 %d/%d，剩余 %d（可能在重试或网络等待）",
+                            pbar.n,
+                            total,
+                            len(pending),
+                        )
+                    last_heartbeat = now
 
     logger.info("全部任务完成，数据已保存至 %s", out_dir.resolve())
 
