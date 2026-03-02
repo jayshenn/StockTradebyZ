@@ -9,13 +9,13 @@ This repository is a script-based Python project (no `src/` package yet). Key fi
 - `find_stock_by_price_concurrent.py`: concurrent historical price lookup.
 - `configs.json`, `stocklist.csv`: runtime inputs.
 
-Generated artifacts include `data/`, `fetch.log`, and `select_results.log`.
+Generated artifacts include `data/`, `out/`, `fetch.log`, and `select_results.log`.
 
 ## Build, Test, and Development Commands
 - `python -m venv .venv && source .venv/bin/activate`: create and activate a local env.
 - `pip install -r requirements.txt`: install runtime dependencies.
 - `python fetch_kline.py --start 20250101 --end today --stocklist ./stocklist.csv --out ./data`: fetch market data.
-- `python select_stock.py --data-dir ./data --config ./configs.json --date 2025-09-10`: run configured strategies.
+- `python select_stock.py --data-dir ./data --config ./configs.json --date 2025-09-10 --out-dir ./out`: run configured strategies.
 - `python SectorShift.py --data_dir ./data --stocklist stocklist.csv --j_threshold 15`: compute industry distribution.
 - `python -m compileall .`: quick syntax sanity check before committing.
 

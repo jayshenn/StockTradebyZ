@@ -20,6 +20,59 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
+
+def _patch_pandas_fillna_method_compat() -> None:
+    """
+    兼容 pandas>=3 与 tushare 旧版内部调用：
+    - 旧代码常用: obj.fillna(method="ffill"/"bfill", ...)
+    - pandas>=3 已移除 method 参数
+    这里做一次轻量 monkey patch，仅在 pandas 主版本>=3 时生效。
+    """
+    try:
+        major = int(str(pd.__version__).split(".", 1)[0])
+    except Exception:
+        return
+    if major < 3:
+        return
+
+    from pandas.core.generic import NDFrame
+
+    if getattr(NDFrame.fillna, "__name__", "") == "_compat_fillna_with_method":
+        return
+
+    _orig_fillna = NDFrame.fillna
+
+    def _compat_fillna_with_method(
+        self,
+        value=None,
+        *,
+        method=None,
+        axis=None,
+        inplace: bool = False,
+        limit=None,
+        **kwargs,
+    ):
+        if method is not None:
+            m = str(method).lower()
+            if m in ("ffill", "pad"):
+                return self.ffill(axis=axis, inplace=inplace, limit=limit)
+            if m in ("bfill", "backfill"):
+                return self.bfill(axis=axis, inplace=inplace, limit=limit)
+            raise ValueError(f"Unsupported fillna(method={method!r})")
+
+        if value is None:
+            raise TypeError("fillna() missing required argument: 'value'")
+        return _orig_fillna(self, value=value, axis=axis, inplace=inplace, limit=limit, **kwargs)
+
+    NDFrame.fillna = _compat_fillna_with_method
+    logging.getLogger("fetch_from_stocklist").warning(
+        "检测到 pandas %s，已启用 fillna(method=...) 兼容补丁（用于 tushare）。",
+        pd.__version__,
+    )
+
+
+_patch_pandas_fillna_method_compat()
+
 # --------------------------- 全局日志配置 --------------------------- #
 LOG_FILE = Path("fetch.log")
 logging.basicConfig(
@@ -202,7 +255,9 @@ def _filter_by_boards_stocklist(df: pd.DataFrame, exclude_boards: set[str]) -> p
     - star : 科创板 688（.SH）
     - bj   : 北交所（.BJ 或 4/8 开头）
     """
-    code = df["symbol"].astype(str)
+    # 注意：stocklist 里的 symbol 可能被 pandas 读成 int（如 000400 -> 400），
+    # 这里先统一补齐到 6 位，避免板块过滤误判。
+    code = df["symbol"].astype(str).str.zfill(6)
     ts_code = df["ts_code"].astype(str).str.upper()
     mask = pd.Series(True, index=df.index)
 
@@ -308,9 +363,14 @@ def main():
         raise ValueError(
             f"未读取到 TUSHARE_TOKEN。请在 {args.env_file} 中配置，例如：TUSHARE_TOKEN=你的token"
         )
-    ts.set_token(ts_token)
+    # 优先使用直传 token，避免 ts.set_token 写入 ~/tk.csv 带来的环境依赖
     global pro
-    pro = ts.pro_api()
+    try:
+        pro = ts.pro_api(ts_token)
+    except TypeError:
+        # 兼容极老版本 tushare
+        ts.set_token(ts_token)
+        pro = ts.pro_api()
     global request_limiter
     request_limiter = MinuteRateLimiter(args.max_requests_per_minute)
 

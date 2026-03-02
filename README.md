@@ -1,8 +1,8 @@
 # Z哥战法的 Python 实现（更新版）
 
-> **更新时间：2025-12-26** –
+> **更新时间：2026-03-02** –
 >
-> 新增 **BigBullishVolumeSelector（暴力K战法）**：用于捕捉放量启动、贴近短线均值的强势阳线；
+> 新增 **ZXBrickTurnSelector（搬砖战法）**：用于捕捉短期“砖型图”由弱转强的拐点信号（XG）。
 
 ---
 
@@ -29,6 +29,7 @@
   * [4. PeakKDJSelector（填坑战法）](#4-peakkdjselector填坑战法)
   * [5. MA60CrossVolumeWaveSelector（上穿60放量战法）](#5-ma60crossvolumewaveselector上穿60放量战法)
   * [6. BigBullishVolumeSelector（暴力K战法）](#6-bigbullishvolumeselector暴力k战法)
+  * [7. ZXBrickTurnSelector（搬砖战法）](#7-zxbrickturnselector搬砖战法)
 
 * [策略流程图（Mermaid）](#策略流程图mermaid)
 * [项目结构](#项目结构)
@@ -42,8 +43,8 @@
 | 名称                    | 功能简介                                                                                                                                                                               |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`fetch_kline.py`**  | 仅使用 **Tushare** 抓取 **A 股日线（前复权 qfq）**。股票池从 `stocklist.csv` 读取，支持排除 **创业板/科创板/北交所**，并发抓取，默认按股票 **增量更新**（仅补新日期，保留历史），输出 CSV 列：`date, open, close, high, low, volume`。 |
-| **`select_stock.py`** | 加载 `./data` 目录内 CSV 行情与 `configs.json`，批量执行选择器（Selector）并输出结果到控制台与 `select_results.log`。                                                                                           |
-| **`Selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 6 个策略，统一纳入“当日过滤 & 知行约束”。                                                                                                                           |
+| **`select_stock.py`** | 加载 `./data` 目录内 CSV 行情与 `configs.json`，批量执行选择器（Selector），输出到控制台与 `select_results.log`，并将结果落盘到 `./out`（JSON + CSV）。                                                                                           |
+| **`Selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 7 个策略。多数策略包含“当日过滤 & 知行约束”，搬砖战法支持按参数启停。                                                                                                                           |
 
 ---
 
@@ -110,10 +111,14 @@ python fetch_kline.py \
 python select_stock.py \
   --data-dir ./data \
   --config ./configs.json \
-  --date 2025-09-10
+  --date 2025-09-10 \
+  --out-dir ./out
 ```
 
 > `--date` 可省略，默认取数据中的最后交易日。
+>
+> 每次运行会在 `--out-dir` 下生成 3 个文件：
+> `select_results_*.json`、`select_results_summary_*.csv`、`select_results_detail_*.csv`。
 
 ---
 
@@ -145,6 +150,28 @@ python select_stock.py \
 | `--data-dir` | `./data`         | CSV 行情目录 |
 | `--config`   | `./configs.json` | 选择器配置    |
 | `--date`     | 数据最后交易日          | 选股交易日    |
+| `--out-dir`  | `./out`          | 结果落盘目录（JSON + CSV） |
+
+---
+
+## 统一当日过滤 & 知行约束
+
+`Selector.py` 中有两类通用过滤：
+
+1. `passes_day_constraints_today(df, pct_limit=0.02, amp_limit=0.07)`  
+   默认要求：
+   - 当日相对前一日涨跌幅绝对值 `< 2%`；
+   - 当日振幅 `(high-low)/low < 7%`。
+
+2. `zx_condition_at_positions(...)`  
+   对应“知行趋势线”条件：
+   - `close > ZXDKX`（可配置）
+   - `ZXDQ > ZXDKX`（可配置）
+
+当前代码口径：
+
+- 前 6 个策略（`BBIKDJ / SuperB1 / BBIShortLong / PeakKDJ / MA60CrossVolumeWave / BigBullishVolume`）默认都会走“当日过滤 + 知行约束”；
+- `ZXBrickTurnSelector（搬砖战法）` 的当日过滤由 `apply_day_constraints` 控制（默认 `false`），知行条件由 `require_close_gt_long`、`require_short_gt_long` 控制。
 
 ---
 
@@ -361,6 +388,66 @@ python select_stock.py \
 }
 ```
 
+### 7. ZXBrickTurnSelector（搬砖战法）
+
+核心逻辑：
+
+1. 按通达信公式计算短期“砖型图”动能：
+   `VAR1A~VAR6A`，并定义 `砖型图 = IF(VAR6A>4, VAR6A-4, 0)`；
+2. 定义 `AA = REF(砖型图,1) < 砖型图`；
+3. 定义 `BB = REF(砖型图,1) > 砖型图`；
+4. 定义 `CC = REF(AA,1)=0 && AA=1`，即“由非增强切换到首次增强”；
+5. 策略默认采用严格“绿转强红”：
+   `T-1` 日满足 `BB`（绿砖），`T` 日满足 `AA`（红砖）；
+6. 策略默认要求“强红力度”：
+   `red_height(T) >= strong_red_ratio * green_height(T-1)`，默认 `strong_red_ratio=0.67`；
+   即当日红砖至少达到前一日绿砖的 2/3。
+7. `XG = CC>0` 作为触发信号；
+8. 叠加知行趋势过滤（可配置）：
+   `close > 长期线` 与 `短期线 > 长期线`。
+9. 最近绿砖占比约束（默认开启）：
+   要求最近 `green_ratio_window` 日（不含当日）中
+   `BB = REF(砖型图,1) > 砖型图` 的占比 ≥ `min_green_ratio`；
+10. 转折前上下文要求（默认开启）：
+   在 `pre_turn_window` 个交易日内，绿砖占比 ≥ `min_pre_green_ratio`，避免强趋势中继误入选；
+11. 可选次日早盘不追高过滤（历史回测可用）：
+   若配置 `next_open_chase_pct_max`，则要求次日开盘不高于当日收盘的对应比例上限。
+
+`configs.json` 预设：
+
+```json
+{
+  "class": "ZXBrickTurnSelector",
+  "alias": "搬砖战法",
+  "activate": true,
+  "params": {
+    "brick_window": 4,
+    "var2_sma_n": 4,
+    "var4_sma_n": 6,
+    "var5_sma_n": 6,
+    "brick_threshold": 4.0,
+    "min_history": 140,
+    "max_window": 180,
+    "require_close_gt_long": true,
+    "require_short_gt_long": true,
+    "require_brick_positive": true,
+    "min_brick_increase": 1.0,
+    "apply_day_constraints": false,
+    "require_recent_green_ratio": true,
+    "green_ratio_window": 4,
+    "min_green_ratio": 0.67,
+    "next_open_chase_pct_max": null,
+    "allow_no_next_bar": true,
+    "require_prev_green": true,
+    "require_strong_red": true,
+    "strong_red_ratio": 0.67,
+    "require_pre_green_context": true,
+    "pre_turn_window": 5,
+    "min_pre_green_ratio": 0.6
+  }
+}
+```
+
 
 ---
 
@@ -452,6 +539,23 @@ flowchart TD
     G --> H[入选]
 ```
 
+### 7. ZXBrickTurnSelector（搬砖战法）
+
+```mermaid
+flowchart TD
+    A[hist 输入] --> B[计算砖型图 VAR1A~VAR6A]
+    B --> C[计算 AA/BB/CC/XG]
+    C --> D[XG 当日触发]
+    D --> E[T-1 绿 T 红]
+    E --> F[前置绿砖上下文通过]
+    F --> G[强红力度 red>=ratio*green]
+    G --> H[最近绿砖占比通过]
+    H --> I[知行趋势过滤通过]
+    I --> J[可选 当日波动约束]
+    J --> K[可选 次日不追高]
+    K --> L[入选]
+```
+
 ---
 
 ## 项目结构
@@ -465,6 +569,7 @@ flowchart TD
 ├── Selector.py              # 策略实现（含公共指标/过滤）
 ├── stocklist.csv            # 你的股票池（示例列：ts_code/symbol/...）
 ├── data/                    # 行情 CSV 输出目录
+├── out/                     # 选股落盘结果（JSON + CSV）
 ├── fetch.log                # 抓取日志
 └── select_results.log       # 选股日志
 ```

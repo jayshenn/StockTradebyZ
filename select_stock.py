@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import importlib
 import json
 import logging
@@ -75,6 +76,70 @@ def instantiate_selector(cfg: Dict[str, Any]):
     return cfg.get("alias", cls_name), cls(**params)
 
 
+def persist_selection_results(
+    *,
+    trade_date: pd.Timestamp,
+    out_dir: Path,
+    run_results: List[Dict[str, Any]],
+) -> Dict[str, Path]:
+    """
+    将当次选股结果落盘：
+    - JSON：完整结构化结果（含每个策略 picks）
+    - CSV(summary)：每个策略一行，含 count 与逗号拼接的 codes
+    - CSV(detail)：每条命中一行（策略 × 股票）
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    date_tag = trade_date.strftime("%Y%m%d")
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    json_fp = out_dir / f"select_results_{date_tag}_{ts_tag}.json"
+    summary_csv_fp = out_dir / f"select_results_summary_{date_tag}_{ts_tag}.csv"
+    detail_csv_fp = out_dir / f"select_results_detail_{date_tag}_{ts_tag}.csv"
+
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "trade_date": str(trade_date.date()),
+        "strategy_count": len(run_results),
+        "results": run_results,
+    }
+    with json_fp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    summary_rows = []
+    detail_rows = []
+    for item in run_results:
+        picks = list(item.get("picks", []))
+        summary_rows.append(
+            {
+                "trade_date": str(trade_date.date()),
+                "alias": item.get("alias", ""),
+                "class": item.get("class", ""),
+                "count": int(item.get("count", len(picks))),
+                "codes": ",".join(picks),
+            }
+        )
+        for idx, code in enumerate(picks, start=1):
+            detail_rows.append(
+                {
+                    "trade_date": str(trade_date.date()),
+                    "alias": item.get("alias", ""),
+                    "class": item.get("class", ""),
+                    "rank": idx,
+                    "code": code,
+                }
+            )
+
+    pd.DataFrame(summary_rows).to_csv(summary_csv_fp, index=False, encoding="utf-8-sig")
+    pd.DataFrame(detail_rows).to_csv(detail_csv_fp, index=False, encoding="utf-8-sig")
+
+    return {
+        "json": json_fp,
+        "summary_csv": summary_csv_fp,
+        "detail_csv": detail_csv_fp,
+    }
+
+
 # ---------- 主函数 ----------
 
 def main():
@@ -83,6 +148,7 @@ def main():
     p.add_argument("--config", default="./configs.json", help="Selector 配置文件")
     p.add_argument("--date", help="交易日 YYYY-MM-DD；缺省=数据最新日期")
     p.add_argument("--tickers", default="all", help="'all' 或逗号分隔股票代码列表")
+    p.add_argument("--out-dir", default="./out", help="结果落盘目录（默认 ./out）")
     args = p.parse_args()
 
     # --- 加载行情 ---
@@ -115,6 +181,7 @@ def main():
 
     # --- 加载 Selector 配置 ---
     selector_cfgs = load_config(Path(args.config))
+    run_results: List[Dict[str, Any]] = []
 
     # --- 逐个 Selector 运行 ---
     for cfg in selector_cfgs:
@@ -127,6 +194,14 @@ def main():
             continue
 
         picks = selector.select(trade_date, data)
+        run_results.append(
+            {
+                "alias": alias,
+                "class": cfg.get("class", ""),
+                "count": len(picks),
+                "picks": picks,
+            }
+        )
 
         # 将结果写入日志，同时输出到控制台
         logger.info("")
@@ -134,6 +209,18 @@ def main():
         logger.info("交易日: %s", trade_date.date())
         logger.info("符合条件股票数: %d", len(picks))
         logger.info("%s", ", ".join(picks) if picks else "无符合条件股票")
+
+    # --- 结果落盘 ---
+    output_files = persist_selection_results(
+        trade_date=trade_date,
+        out_dir=Path(args.out_dir),
+        run_results=run_results,
+    )
+    logger.info("")
+    logger.info("结果已落盘：")
+    logger.info("JSON: %s", output_files["json"])
+    logger.info("Summary CSV: %s", output_files["summary_csv"])
+    logger.info("Detail CSV: %s", output_files["detail_csv"])
 
 
 if __name__ == "__main__":
