@@ -288,12 +288,14 @@ def zx_condition_at_positions(
     *,
     require_close_gt_long: bool = True,
     require_short_gt_long: bool = True,
+    require_low_gt_long: bool = False,
     pos: int | None = None,
 ) -> bool:
     """
     在指定位置 pos（iloc 位置；None 表示当日）检查知行条件：
       - 收盘 > 长期线（可选）
       - 短期线 > 长期线（可选）
+      - 最低价 > 长期线（可选）
     注：长期线需满样本；若为 NaN 直接返回 False。
     """
     if df.empty:
@@ -308,6 +310,7 @@ def zx_condition_at_positions(
     s = float(zxdq.iloc[pos])
     l = float(zxdkx.iloc[pos]) if pd.notna(zxdkx.iloc[pos]) else float("nan")
     c = float(df["close"].iloc[pos])
+    lo = float(df["low"].iloc[pos])
 
     if not np.isfinite(l) or not np.isfinite(s):
         return False
@@ -315,6 +318,8 @@ def zx_condition_at_positions(
     if require_close_gt_long and not (c > l):
         return False
     if require_short_gt_long and not (s > l):
+        return False
+    if require_low_gt_long and not (np.isfinite(lo) and lo > l):
         return False
     return True
 
@@ -1069,6 +1074,7 @@ class ZXBrickTurnSelector:
         max_window: int = 180,
         require_close_gt_long: bool = True,
         require_short_gt_long: bool = True,
+        require_low_gt_long: bool = False,
         require_brick_positive: bool = True,
         min_brick_increase: float = 0.0,
         apply_day_constraints: bool = False,
@@ -1116,6 +1122,7 @@ class ZXBrickTurnSelector:
         self.max_window = int(max_window)
         self.require_close_gt_long = bool(require_close_gt_long)
         self.require_short_gt_long = bool(require_short_gt_long)
+        self.require_low_gt_long = bool(require_low_gt_long)
         self.require_brick_positive = bool(require_brick_positive)
         self.min_brick_increase = float(min_brick_increase)
         self.apply_day_constraints = bool(apply_day_constraints)
@@ -1147,6 +1154,7 @@ class ZXBrickTurnSelector:
             hist,
             require_close_gt_long=self.require_close_gt_long,
             require_short_gt_long=self.require_short_gt_long,
+            require_low_gt_long=self.require_low_gt_long,
             pos=None,
         ):
             return False

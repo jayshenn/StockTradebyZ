@@ -100,6 +100,7 @@
         "max_window": 180,
         "require_close_gt_long": true,
         "require_short_gt_long": true,
+        "require_low_gt_long": true,
         "require_brick_positive": true,
         "min_brick_increase": 0.0,
         "apply_day_constraints": false,
