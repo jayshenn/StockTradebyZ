@@ -11,6 +11,13 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 # ---------- 日志 ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -18,7 +25,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         # 将日志写入文件
-        logging.FileHandler("select_results.log", encoding="utf-8"),
+        logging.FileHandler(LOG_DIR / "select_results.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("select")
@@ -54,7 +61,7 @@ def load_config(cfg_path: Path) -> List[Dict[str, Any]]:
         cfgs = [cfg_raw]
 
     if not cfgs:
-        logger.error("configs.json 未定义任何 Selector")
+        logger.error("配置文件未定义任何 Selector")
         sys.exit(1)
 
     return cfgs
@@ -67,10 +74,10 @@ def instantiate_selector(cfg: Dict[str, Any]):
         raise ValueError("缺少 class 字段")
 
     try:
-        module = importlib.import_module("Selector")
+        module = importlib.import_module("core.selector")
         cls = getattr(module, cls_name)
     except (ModuleNotFoundError, AttributeError) as e:
-        raise ImportError(f"无法加载 Selector.{cls_name}: {e}") from e
+        raise ImportError(f"无法加载 core.selector.{cls_name}: {e}") from e
 
     params = cfg.get("params", {})
     return cfg.get("alias", cls_name), cls(**params)
@@ -143,9 +150,9 @@ def persist_selection_results(
 # ---------- 主函数 ----------
 
 def main():
-    p = argparse.ArgumentParser(description="Run selectors defined in configs.json")
+    p = argparse.ArgumentParser(description="Run selectors defined in configs/configs.json")
     p.add_argument("--data-dir", default="./data", help="CSV 行情目录")
-    p.add_argument("--config", default="./configs.json", help="Selector 配置文件")
+    p.add_argument("--config", default="./configs/configs.json", help="Selector 配置文件")
     p.add_argument("--date", help="交易日 YYYY-MM-DD；缺省=数据最新日期")
     p.add_argument("--tickers", default="all", help="'all' 或逗号分隔股票代码列表")
     p.add_argument("--out-dir", default="./out", help="结果落盘目录（默认 ./out）")

@@ -42,9 +42,9 @@
 
 | 名称                    | 功能简介                                                                                                                                                                               |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`fetch_kline.py`**  | 仅使用 **Tushare** 抓取 **A 股日线（前复权 qfq）**。股票池从 `stocklist.csv` 读取，支持排除 **创业板/科创板/北交所**，并发抓取，默认按股票 **增量更新**（仅补新日期，保留历史），输出 CSV 列：`date, open, close, high, low, volume`。 |
-| **`select_stock.py`** | 加载 `./data` 目录内 CSV 行情与 `configs.json`，批量执行选择器（Selector），输出到控制台与 `select_results.log`，并将结果落盘到 `./out`（JSON + CSV）。                                                                                           |
-| **`Selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 7 个策略。多数策略包含“当日过滤 & 知行约束”，搬砖战法支持按参数启停。                                                                                                                           |
+| **`scripts/fetch_kline.py`**  | 仅使用 **Tushare** 抓取 **A 股日线（前复权 qfq）**。股票池从 `configs/stocklist.csv` 读取，支持排除 **创业板/科创板/北交所**，并发抓取，默认按股票 **增量更新**（仅补新日期，保留历史），输出 CSV 列：`date, open, close, high, low, volume`。 |
+| **`scripts/select_stock.py`** | 加载 `./data` 目录内 CSV 行情与 `configs/configs.json`，批量执行选择器（Selector），输出到控制台与 `logs/select_results.log`，并将结果落盘到 `./out`（JSON + CSV）。                                                                                           |
+| **`core/selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 7 个策略。多数策略包含“当日过滤 & 知行约束”，搬砖战法支持按参数启停。                                                                                                                           |
 
 ---
 
@@ -86,15 +86,15 @@ cp .env.example .env
 TUSHARE_TOKEN=你的token
 ```
 
-> `fetch_kline.py` 默认会读取 `./.env`。如需使用其它路径，可传 `--env-file /path/to/.env`。
+> `scripts/fetch_kline.py` 默认会读取 `./.env`。如需使用其它路径，可传 `--env-file /path/to/.env`。
 
 ### 下载历史 K 线（qfq，日线）
 
 ```bash
-python fetch_kline.py \
+python scripts/fetch_kline.py \
   --start 20240101 \
   --end today \
-  --stocklist ./stocklist.csv \
+  --stocklist ./configs/stocklist.csv \
   --exclude-boards gem star bj \
   --out ./data \
   --workers 6 \
@@ -108,10 +108,10 @@ python fetch_kline.py \
 ### 运行选股
 
 ```bash
-python select_stock.py \
+python scripts/select_stock.py \
   --data-dir ./data \
-  --config ./configs.json \
-  --date 2025-09-10 \
+  --config ./configs/configs.json \
+  --date 2026-03-02 \
   --out-dir ./out
 ```
 
@@ -126,11 +126,13 @@ python select_stock.py \
 
 ### `fetch_kline.py`
 
+实际实现位于 `scripts/fetch_kline.py`。
+
 | 参数                 | 默认值               | 说明                                                                         |
 | ------------------ | ----------------- | -------------------------------------------------------------------------- |
 | `--start`          | `20190101`        | 起始日期，格式 `YYYYMMDD` 或 `today`                                               |
 | `--end`            | `today`           | 结束日期，格式同上                                                                  |
-| `--stocklist`      | `./stocklist.csv` | 股票清单 CSV 路径（含 `ts_code` 或 `symbol`）                                        |
+| `--stocklist`      | `./configs/stocklist.csv` | 股票清单 CSV 路径（含 `ts_code` 或 `symbol`）                                        |
 | `--exclude-boards` | `[]`              | 排除板块，枚举：`gem`(创业板 300/301) / `star`(科创板 688) / `bj`(北交所 .BJ / 4/8 开头)。可多选。 |
 | `--env-file`       | `./.env`          | `.env` 文件路径（读取 `TUSHARE_TOKEN`）                                              |
 | `--out`            | `./data`          | 输出目录（自动创建）                                                                 |
@@ -145,10 +147,12 @@ python select_stock.py \
 
 ### `select_stock.py`
 
+实际实现位于 `scripts/select_stock.py`。
+
 | 参数           | 默认值              | 说明       |
 | ------------ | ---------------- | -------- |
 | `--data-dir` | `./data`         | CSV 行情目录 |
-| `--config`   | `./configs.json` | 选择器配置    |
+| `--config`   | `./configs/configs.json` | 选择器配置    |
 | `--date`     | 数据最后交易日          | 选股交易日    |
 | `--out-dir`  | `./out`          | 结果落盘目录（JSON + CSV） |
 
@@ -156,7 +160,7 @@ python select_stock.py \
 
 ## 统一当日过滤 & 知行约束
 
-`Selector.py` 中有两类通用过滤：
+`core/selector.py` 中有两类通用过滤：
 
 1. `passes_day_constraints_today(df, pct_limit=0.02, amp_limit=0.07)`  
    默认要求：
@@ -190,7 +194,7 @@ python select_stock.py \
 * **MA60 条件**：当日 `close ≥ MA60` 且最近 `max_window` 内存在“**有效上穿 MA60**”；
 * **知行当日约束**：**收盘 > 长期线** 且 **短期线 > 长期线**。
 
-`configs.json` 预设（与示例一致）：
+`configs/configs.json` 预设（与示例一致）：
 
 ```json
 {
@@ -221,7 +225,7 @@ python select_stock.py \
    * 在 `t_m` 当日：**收盘 > 长期线** 且 **短期线 > 长期线**；
    * 在 **当日**：只需 **短期线 > 长期线**。
 
-`configs.json` 预设：
+`configs/configs.json` 预设：
 
 ```json
 {
@@ -259,7 +263,7 @@ python select_stock.py \
 * **MACD**：`DIF > 0`；
 * **知行当日约束**：**收盘 > 长期线** 且 **短期线 > 长期线**。
 
-`configs.json` 预设：
+`configs/configs.json` 预设：
 
 ```json
 {
@@ -289,7 +293,7 @@ python select_stock.py \
 * 当日 J **< `j_threshold`** 或 **≤ `j_q_threshold` 分位**；
 * **知行当日约束**：**收盘 > 长期线** 且 **短期线 > 长期线**。
 
-`configs.json` 预设：
+`configs/configs.json` 预设：
 
 ```json
 {
@@ -316,7 +320,7 @@ python select_stock.py \
 4. `MA60` 的最近 `ma60_slope_days` 日 **回归斜率 > 0**；
 5. **知行当日约束**：**收盘 > 长期线** 且 **短期线 > 长期线**。
 
-`configs.json` 预设：
+`configs/configs.json` 预设：
 
 ```json
 {
@@ -370,7 +374,7 @@ python select_stock.py \
 
 ---
 
-`configs.json` 预设：
+`configs/configs.json` 预设：
 
 ```json
 {
@@ -413,7 +417,7 @@ python select_stock.py \
 11. 可选次日早盘不追高过滤（历史回测可用）：
    若配置 `next_open_chase_pct_max`，则要求次日开盘不高于当日收盘的对应比例上限。
 
-`configs.json` 预设：
+`configs/configs.json` 预设：
 
 ```json
 {
@@ -563,15 +567,20 @@ flowchart TD
 ```
 .
 ├── .env.example             # Token 配置模板（复制为 .env 后填写）
-├── configs.json             # 选择器参数（示例见上文）
-├── fetch_kline.py           # 从 stocklist.csv 读取并抓取 Tushare 日线（qfq）
-├── select_stock.py          # 批量选股入口
-├── Selector.py              # 策略实现（含公共指标/过滤）
-├── stocklist.csv            # 你的股票池（示例列：ts_code/symbol/...）
+├── configs/
+│   ├── configs.json         # 选择器参数
+│   ├── configs.template.json
+│   └── stocklist.csv        # 股票池（示例列：ts_code/symbol/...）
+├── core/
+│   └── selector.py          # 策略实现（含公共指标/过滤）
+├── scripts/
+│   ├── fetch_kline.py       # 抓取入口
+│   ├── select_stock.py      # 选股入口
+│   ├── SectorShift.py       # 行业分布分析
+│   └── find_stock_by_price_concurrent.py
 ├── data/                    # 行情 CSV 输出目录
 ├── out/                     # 选股落盘结果（JSON + CSV）
-├── fetch.log                # 抓取日志
-└── select_results.log       # 选股日志
+└── logs/                    # 运行日志目录（fetch/select）
 ```
 
 ---

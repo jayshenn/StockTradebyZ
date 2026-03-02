@@ -6,6 +6,7 @@ __pycache__/
 # runtime artifacts
 fetch.log
 select_results.log
+logs/
 data/
 out/
 stocks_pro_max.csv

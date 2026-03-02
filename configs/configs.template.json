@@ -89,7 +89,7 @@
     {
       "class": "ZXBrickTurnSelector",
       "alias": "搬砖战法",
-      "activate": true,
+      "activate": false,
       "params": {
         "brick_window": 4,
         "var2_sma_n": 4,
@@ -101,6 +101,8 @@
         "require_close_gt_long": true,
         "require_short_gt_long": true,
         "require_low_gt_long": true,
+        "max_close_to_short_mult": 1.1,
+        "max_low_to_short_mult": 1.05,
         "require_brick_positive": true,
         "min_brick_increase": 0.0,
         "apply_day_constraints": false,

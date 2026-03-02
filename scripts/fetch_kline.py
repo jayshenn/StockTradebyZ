@@ -21,6 +21,9 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _patch_pandas_fillna_method_compat() -> None:
     """
@@ -79,7 +82,7 @@ def _patch_pandas_fillna_method_compat() -> None:
 _patch_pandas_fillna_method_compat()
 
 # --------------------------- 全局日志配置 --------------------------- #
-LOG_FILE = Path("fetch.log")
+LOG_FILE = LOG_DIR / "fetch.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(filename)s:%(lineno)d %(message)s",
@@ -396,7 +399,7 @@ def main():
     parser.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD 或 'today'")
     parser.add_argument("--end", default="today", help="结束日期 YYYYMMDD 或 'today'")
     # 股票清单与板块过滤
-    parser.add_argument("--stocklist", type=Path, default=Path("./stocklist.csv"), help="股票清单CSV路径（需含 ts_code 或 symbol）")
+    parser.add_argument("--stocklist", type=Path, default=Path("./configs/stocklist.csv"), help="股票清单CSV路径（需含 ts_code 或 symbol）")
     parser.add_argument(
         "--exclude-boards",
         nargs="*",
