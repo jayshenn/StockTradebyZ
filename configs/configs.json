@@ -89,7 +89,7 @@
     {
       "class": "ZXBrickTurnSelector",
       "alias": "搬砖战法",
-      "activate": false,
+      "activate": true,
       "params": {
         "brick_window": 4,
         "var2_sma_n": 4,
