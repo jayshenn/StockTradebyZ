@@ -113,7 +113,7 @@ python scripts/fetch_kline.py \
 python scripts/select_stock.py \
   --data-dir ./data \
   --config ./configs/configs.json \
-  --date 2026-03-02 \
+  --date 2026-03-03 \
   --out-dir ./out
 ```
 
@@ -461,8 +461,8 @@ python scripts/backtest_selectors.py \
 5. 策略默认采用严格“绿转强红”：
    `T-1` 日满足 `BB`（绿砖），`T` 日满足 `AA`（红砖）；
 6. 策略默认要求“强红力度”：
-   `red_height(T) >= strong_red_ratio * green_height(T-1)`，默认 `strong_red_ratio=0.67`；
-   即当日红砖至少达到前一日绿砖的 2/3。
+   `red_height(T) >= strong_red_ratio * green_height(T-1)`，默认 `strong_red_ratio=1.15`；
+   即当日红砖至少达到前一日绿砖的 1.15 倍。
 7. `XG = CC>0` 作为触发信号；
 8. 叠加知行趋势过滤（可配置）：
    `close > 长期线` 与 `短期线 > 长期线`。
@@ -471,8 +471,9 @@ python scripts/backtest_selectors.py \
    `BB = REF(砖型图,1) > 砖型图` 的占比 ≥ `min_green_ratio`；
 10. 转折前上下文要求（默认开启）：
    在 `pre_turn_window` 个交易日内，绿砖占比 ≥ `min_pre_green_ratio`，避免强趋势中继误入选；
-11. 可选次日早盘不追高过滤（历史回测可用）：
-   若配置 `next_open_chase_pct_max`，则要求次日开盘不高于当日收盘的对应比例上限。
+11. 可选次日早盘不追高过滤（执行层规则，默认关闭）：
+   若配置 `next_open_chase_pct_max`，则要求次日开盘不高于当日收盘的对应比例上限；
+   当前默认 `null`，选股阶段不使用未来次日数据。
 
 `configs/configs.json` 预设：
 
@@ -491,17 +492,20 @@ python scripts/backtest_selectors.py \
     "max_window": 180,
     "require_close_gt_long": true,
     "require_short_gt_long": true,
+    "require_low_gt_long": false,
+    "max_close_to_short_mult": 1.09,
+    "max_low_to_short_mult": 1.02,
     "require_brick_positive": true,
-    "min_brick_increase": 1.0,
+    "min_brick_increase": 0.5,
     "apply_day_constraints": false,
     "require_recent_green_ratio": true,
     "green_ratio_window": 4,
-    "min_green_ratio": 0.67,
+    "min_green_ratio": 0.75,
     "next_open_chase_pct_max": null,
     "allow_no_next_bar": true,
     "require_prev_green": true,
     "require_strong_red": true,
-    "strong_red_ratio": 0.67,
+    "strong_red_ratio": 1.15,
     "require_pre_green_context": true,
     "pre_turn_window": 5,
     "min_pre_green_ratio": 0.6
@@ -650,7 +654,13 @@ flowchart TD
 **Q2：增量更新是怎么做的？会不会改写历史？**
 默认只拉取“本地最后日期之后”的新数据，并与本地 CSV 去重合并，通常不会重写旧日期。若你希望重建某只股票的全历史，可删除对应 `data/XXXXXX.csv` 后重新抓取。
 
-**Q3：创业板/科创板/北交所如何排除？**
+**Q3：前复权（qfq）+ 增量更新会不会让历史数据变旧？**
+会有这个可能。前复权在分红送转后会重算历史价格；若长期只做增量，旧日期数据可能与最新复权口径存在偏差。实务上建议定期重建 `data/`：
+- 高频交易/超短线：建议每周重抓一次；
+- 一般研究：建议每月重抓一次。
+做法就是删除 `data/` 下旧 CSV 后，按当前参数全量重新抓取。
+
+**Q4：创业板/科创板/北交所如何排除？**
 运行时使用 `--exclude-boards gem star bj`，或按需选择其一/其二。
 
 ---
