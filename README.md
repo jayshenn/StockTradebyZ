@@ -16,10 +16,12 @@
   * [准备 stocklist.csv](#准备-stocklistcsv)
   * [下载历史 K 线（qfq，日线）](#下载历史-k-线qfq日线)
   * [运行选股](#运行选股)
+  * [运行回测](#运行回测)
 * [参数说明](#参数说明)
 
   * [`fetch_kline.py`](#fetch_klinepy)
   * [`select_stock.py`](#select_stockpy)
+  * [`backtest_selectors.py`](#backtest_selectorspy)
 * [统一当日过滤 & 知行约束](#统一当日过滤--知行约束)
 * [内置策略（Selector）](#内置策略selector)
 
@@ -120,6 +122,38 @@ python scripts/select_stock.py \
 > 每次运行会在 `--out-dir` 下生成 3 个文件：
 > `select_results_*.json`、`select_results_summary_*.csv`、`select_results_detail_*.csv`。
 
+### 运行回测
+
+```bash
+python scripts/backtest_selectors.py \
+  --data-dir ./data \
+  --config ./configs/configs.json \
+  --start-date 2025-01-01 \
+  --end-date 2026-03-02 \
+  --selector 少妇战法 \
+  --exit-mode adaptive \
+  --max-hold-days 60 \
+  --stop-buffer-pct 0.001 \
+  --n-structure-lookback 60 \
+  --big-bull-body-pct 0.03 \
+  --entry-price open \
+  --benchmark-code 000001 \
+  --out-dir ./out
+```
+
+说明：
+
+* 回测会按交易日逐日调用对应 `Selector` 选股；
+* 每个信号在下一根 K 线入场（`--entry-price open|close`）；
+* `fixed` 模式：持有 `--hold-days` 根后离场（旧逻辑）；
+* `adaptive` 模式（止盈止损）：
+  * 止损：以“入场 K 线 low 与 N 型上一个低点”的更低者下浮 `--stop-buffer-pct` 作为止损价；
+  * 止盈放飞：`BBI` 上方连续两根中大阳线（实体涨幅 ≥ `--big-bull-body-pct`）减半仓，后续重复；
+  * 离场：连续两日收盘跌破 `BBI` 全部离场；
+  * 保险阀：持有超过 `--max-hold-days` 收盘离场；
+* 同时持有的仓位按“当日等权”合成策略日收益；
+* 输出 `summary.csv + 每策略 daily.csv + 每策略 trades.csv + json`。
+
 ---
 
 ## 参数说明
@@ -155,6 +189,29 @@ python scripts/select_stock.py \
 | `--config`   | `./configs/configs.json` | 选择器配置    |
 | `--date`     | 数据最后交易日          | 选股交易日    |
 | `--out-dir`  | `./out`          | 结果落盘目录（JSON + CSV） |
+
+### `backtest_selectors.py`
+
+实际实现位于 `scripts/backtest_selectors.py`。
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--data-dir` | `./data` | CSV 行情目录 |
+| `--config` | `./configs/configs.json` | Selector 配置文件 |
+| `--start-date` | 必填 | 回测起始日期 `YYYY-MM-DD` |
+| `--end-date` | 必填 | 回测结束日期 `YYYY-MM-DD` |
+| `--tickers` | `all` | `all` 或逗号分隔代码 |
+| `--selector` | `all` | `all` 或逗号分隔策略 `alias/class` |
+| `--entry-price` | `open` | 入场价：`open` 或 `close` |
+| `--exit-mode` | `fixed` | 离场模式：`fixed` 或 `adaptive` |
+| `--hold-days` | `5` | `fixed` 模式每笔持有 K 线根数 |
+| `--max-hold-days` | `60` | `adaptive` 模式最大持有根数（保险阀） |
+| `--stop-buffer-pct` | `0.001` | 止损线下浮比例（0.1%） |
+| `--n-structure-lookback` | `60` | N 型上一个低点回看窗口 |
+| `--big-bull-body-pct` | `0.03` | 中大阳线实体阈值（3%） |
+| `--min-position-ratio-for-halve` | `0.02` | 剩余仓位市值低于该比例时不再继续减半 |
+| `--benchmark-code` | 空 | 可选基准代码（需在 `data` 目录中存在） |
+| `--out-dir` | `./out` | 输出目录 |
 
 ---
 
