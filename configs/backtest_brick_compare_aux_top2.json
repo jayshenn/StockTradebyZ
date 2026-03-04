@@ -1,0 +1,100 @@
+{
+  "selectors": [
+    {
+      "class": "ZXBrickTurnSelector",
+      "alias": "搬砖_基准_top2",
+      "activate": true,
+      "params": {
+        "brick_window": 4,
+        "var2_sma_n": 4,
+        "var4_sma_n": 6,
+        "var5_sma_n": 6,
+        "brick_threshold": 4.0,
+        "m1": 14,
+        "m2": 28,
+        "m3": 57,
+        "m4": 114,
+        "min_history": 140,
+        "max_window": 180,
+        "strong_red_ratio": 0.6666666667,
+        "daily_trade_cap": 2
+      }
+    },
+    {
+      "class": "ZXBrickTurnSelector",
+      "alias": "搬砖_增强v2_top2",
+      "activate": true,
+      "params": {
+        "brick_window": 4,
+        "var2_sma_n": 4,
+        "var4_sma_n": 6,
+        "var5_sma_n": 6,
+        "brick_threshold": 4.0,
+        "m1": 14,
+        "m2": 28,
+        "m3": 57,
+        "m4": 114,
+        "min_history": 140,
+        "max_window": 180,
+        "strong_red_ratio": 0.6666666667,
+        "aux_data_dir": "./data_aux",
+        "t_day_pct_min": 0.025,
+        "t_day_pct_max": 0.09,
+        "close_near_high_max": 0.25,
+        "body_ratio_min": 0.35,
+        "close_to_zxdq_max_mult": 1.1,
+        "daily_basic_volume_ratio_min": 1.0,
+        "daily_basic_volume_ratio_max": 4.5,
+        "require_moneyflow_3d_net_inflow": true,
+        "require_moneyflow_3d_large_net_inflow": false,
+        "moneyflow_lookback_days": 3,
+        "require_sw_strength": true,
+        "sw_strength_quantile_min": 0.4,
+        "require_sw_positive": false,
+        "daily_trade_cap": 2
+      }
+    },
+    {
+      "class": "ZXBrickTurnSelector",
+      "alias": "搬砖_增强v3_top2",
+      "activate": true,
+      "params": {
+        "brick_window": 4,
+        "var2_sma_n": 4,
+        "var4_sma_n": 6,
+        "var5_sma_n": 6,
+        "brick_threshold": 4.0,
+        "m1": 14,
+        "m2": 28,
+        "m3": 57,
+        "m4": 114,
+        "min_history": 140,
+        "max_window": 180,
+        "strong_red_ratio": 0.6666666667,
+        "aux_data_dir": "./data_aux",
+        "t_day_pct_min": 0.025,
+        "t_day_pct_max": 0.09,
+        "close_near_high_max": 0.25,
+        "body_ratio_min": 0.35,
+        "close_to_zxdq_max_mult": 1.1,
+        "daily_basic_volume_ratio_min": 1.0,
+        "daily_basic_volume_ratio_max": 4.5,
+        "require_moneyflow_3d_net_inflow": true,
+        "require_moneyflow_3d_large_net_inflow": false,
+        "moneyflow_lookback_days": 3,
+        "require_sw_strength": true,
+        "sw_strength_quantile_min": 0.4,
+        "require_sw_positive": false,
+        "use_score_model": true,
+        "score_weights": {
+          "brick_strength": 0.35,
+          "volume_ratio": 0.25,
+          "moneyflow_strength": 0.2,
+          "industry_strength": 0.2
+        },
+        "score_moneyflow_lookback_days": 3,
+        "daily_trade_cap": 2
+      }
+    }
+  ]
+}

@@ -32,7 +32,43 @@ logger = logging.getLogger("select")
 STOCKLIST_FIELDS = ["ts_code", "symbol", "name", "area", "industry"]
 STOCKINFO_COLUMNS = ["trade_date", "strategy_alias", "ts_code", "symbol", "name", "area", "industry"]
 DETAIL_COLUMNS = ["trade_date", "alias", "class", "rank", "code"]
-SUMMARY_COLUMNS = ["trade_date", "alias", "class", "count", "codes"]
+SUMMARY_COLUMNS = [
+    "trade_date",
+    "alias",
+    "class",
+    "count",
+    "codes",
+    "core_pass_count",
+    "hard_pass_count",
+    "selected_count",
+    "cap_reject_count",
+]
+FILTER_AUDIT_COLUMNS = [
+    "trade_date",
+    "alias",
+    "class",
+    "code",
+    "ts_code",
+    "stage",
+    "rule_code",
+    "rule_name",
+    "passed",
+    "actual_value",
+    "threshold_expr",
+    "reason",
+]
+EXEC_AUDIT_COLUMNS = [
+    "trade_date",
+    "alias",
+    "class",
+    "code",
+    "ts_code",
+    "stage",
+    "score",
+    "brick_strength",
+    "rank_before_cap",
+    "reject_reason",
+]
 
 
 # ---------- 工具 ----------
@@ -129,6 +165,9 @@ def persist_selection_results(
     out_dir: Path,
     run_results: List[Dict[str, Any]],
     stock_meta: Dict[str, Dict[str, str]],
+    audit_level: str,
+    filter_audit_rows: List[Dict[str, Any]],
+    execution_audit_rows: List[Dict[str, Any]],
 ) -> Dict[str, Path]:
     """
     将当次选股结果落盘：
@@ -145,6 +184,10 @@ def persist_selection_results(
     summary_csv_fp = out_dir / f"select_results_summary_{date_tag}_{ts_tag}.csv"
     detail_csv_fp = out_dir / f"select_results_detail_{date_tag}_{ts_tag}.csv"
     stockinfo_csv_fp = out_dir / f"select_results_stockinfo_{date_tag}_{ts_tag}.csv"
+    filter_audit_csv_fp = out_dir / f"select_filter_audit_{date_tag}_{ts_tag}.csv"
+    filter_audit_json_fp = out_dir / f"select_filter_audit_{date_tag}_{ts_tag}.json"
+    execution_audit_csv_fp = out_dir / f"select_execution_audit_{date_tag}_{ts_tag}.csv"
+    execution_audit_json_fp = out_dir / f"select_execution_audit_{date_tag}_{ts_tag}.json"
 
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -167,6 +210,10 @@ def persist_selection_results(
                 "class": item.get("class", ""),
                 "count": int(item.get("count", len(picks))),
                 "codes": ",".join(picks),
+                "core_pass_count": int(item.get("core_pass_count", 0)),
+                "hard_pass_count": int(item.get("hard_pass_count", 0)),
+                "selected_count": int(item.get("selected_count", len(picks))),
+                "cap_reject_count": int(item.get("cap_reject_count", 0)),
             }
         )
         for idx, code in enumerate(picks, start=1):
@@ -196,12 +243,43 @@ def persist_selection_results(
     pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS).to_csv(summary_csv_fp, index=False, encoding="utf-8-sig")
     pd.DataFrame(detail_rows, columns=DETAIL_COLUMNS).to_csv(detail_csv_fp, index=False, encoding="utf-8-sig")
     pd.DataFrame(stockinfo_rows, columns=STOCKINFO_COLUMNS).to_csv(stockinfo_csv_fp, index=False, encoding="utf-8-sig")
+    pd.DataFrame(filter_audit_rows, columns=FILTER_AUDIT_COLUMNS).to_csv(
+        filter_audit_csv_fp,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(execution_audit_rows, columns=EXEC_AUDIT_COLUMNS).to_csv(
+        execution_audit_csv_fp,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    filter_payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "trade_date": str(trade_date.date()),
+        "audit_level": audit_level,
+        "rows": filter_audit_rows,
+    }
+    execution_payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "trade_date": str(trade_date.date()),
+        "audit_level": audit_level,
+        "rows": execution_audit_rows,
+    }
+    with filter_audit_json_fp.open("w", encoding="utf-8") as f:
+        json.dump(filter_payload, f, ensure_ascii=False, indent=2)
+    with execution_audit_json_fp.open("w", encoding="utf-8") as f:
+        json.dump(execution_payload, f, ensure_ascii=False, indent=2)
 
     return {
         "json": json_fp,
         "summary_csv": summary_csv_fp,
         "detail_csv": detail_csv_fp,
         "stockinfo_csv": stockinfo_csv_fp,
+        "filter_audit_csv": filter_audit_csv_fp,
+        "filter_audit_json": filter_audit_json_fp,
+        "execution_audit_csv": execution_audit_csv_fp,
+        "execution_audit_json": execution_audit_json_fp,
     }
 
 
@@ -215,6 +293,12 @@ def main():
     p.add_argument("--tickers", default="all", help="'all' 或逗号分隔股票代码列表")
     p.add_argument("--out-dir", default="./out", help="结果落盘目录（默认 ./out）")
     p.add_argument("--stocklist", default="./configs/stocklist.csv", help="股票信息 CSV（默认 ./configs/stocklist.csv）")
+    p.add_argument(
+        "--audit",
+        choices=["off", "failed_only", "full"],
+        default="failed_only",
+        help="过滤审计级别：off/failed_only/full",
+    )
     args = p.parse_args()
 
     # --- 加载行情 ---
@@ -249,6 +333,8 @@ def main():
     selector_cfgs = load_config(Path(args.config))
     stock_meta = load_stock_meta(Path(args.stocklist))
     run_results: List[Dict[str, Any]] = []
+    filter_audit_rows: List[Dict[str, Any]] = []
+    execution_audit_rows: List[Dict[str, Any]] = []
 
     # --- 逐个 Selector 运行 ---
     for cfg in selector_cfgs:
@@ -260,13 +346,44 @@ def main():
             logger.error("跳过配置 %s：%s", cfg, e)
             continue
 
-        picks = selector.select(trade_date, data)
+        core_pass_count = 0
+        hard_pass_count = 0
+        selected_count = 0
+        cap_reject_count = 0
+
+        if hasattr(selector, "select_with_audit"):
+            select_result = selector.select_with_audit(trade_date, data, audit_level=args.audit)
+            picks = list(select_result.get("picks_final", []))
+            summary = dict(select_result.get("audit_summary", {}))
+            core_pass_count = int(summary.get("core_pass_count", 0))
+            hard_pass_count = int(summary.get("hard_pass_count", 0))
+            selected_count = int(summary.get("selected_count", len(picks)))
+            cap_reject_count = int(summary.get("cap_reject_count", 0))
+            for row in list(select_result.get("audit_rows", [])):
+                merged = {
+                    "trade_date": str(trade_date.date()),
+                    "alias": alias,
+                    "class": cfg.get("class", ""),
+                    **row,
+                }
+                if row.get("stage") == "execution":
+                    execution_audit_rows.append(merged)
+                else:
+                    filter_audit_rows.append(merged)
+        else:
+            picks = selector.select(trade_date, data)
+            selected_count = len(picks)
+
         run_results.append(
             {
                 "alias": alias,
                 "class": cfg.get("class", ""),
                 "count": len(picks),
                 "picks": picks,
+                "core_pass_count": core_pass_count,
+                "hard_pass_count": hard_pass_count,
+                "selected_count": selected_count,
+                "cap_reject_count": cap_reject_count,
             }
         )
 
@@ -283,6 +400,9 @@ def main():
         out_dir=Path(args.out_dir),
         run_results=run_results,
         stock_meta=stock_meta,
+        audit_level=args.audit,
+        filter_audit_rows=filter_audit_rows,
+        execution_audit_rows=execution_audit_rows,
     )
     logger.info("")
     logger.info("结果已落盘：")
@@ -290,6 +410,10 @@ def main():
     logger.info("Summary CSV: %s", output_files["summary_csv"])
     logger.info("Detail CSV: %s", output_files["detail_csv"])
     logger.info("StockInfo CSV: %s", output_files["stockinfo_csv"])
+    logger.info("Filter Audit CSV: %s", output_files["filter_audit_csv"])
+    logger.info("Filter Audit JSON: %s", output_files["filter_audit_json"])
+    logger.info("Execution Audit CSV: %s", output_files["execution_audit_csv"])
+    logger.info("Execution Audit JSON: %s", output_files["execution_audit_json"])
 
 
 if __name__ == "__main__":

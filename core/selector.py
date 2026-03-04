@@ -1,3 +1,5 @@
+from collections import OrderedDict
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from scipy.signal import find_peaks
@@ -1069,10 +1071,9 @@ class BigBullishVolumeSelector:
 
 class ZXBrickTurnSelector:
     """
-    知行短期砖型图选股器（v2026 简化版）。
-    仅保留两条选股逻辑：
-    1) 收盘在黄线之上，白线在黄线之上。
-    2) T-1 绿砖、T 红砖，且红砖高度 >= strong_red_ratio * 绿砖高度。
+    知行短期砖型图选股器（ZXBrick v3）。
+    流水：
+      universe -> core_signal -> hard_filter -> score -> rank/top_n -> daily_trade_cap
     """
 
     def __init__(
@@ -1090,6 +1091,25 @@ class ZXBrickTurnSelector:
         min_history: int = 140,
         max_window: int = 180,
         strong_red_ratio: float = 2 / 3,
+        aux_data_dir: str | None = None,
+        t_day_pct_min: float | None = None,
+        t_day_pct_max: float | None = None,
+        close_near_high_max: float | None = None,
+        body_ratio_min: float | None = None,
+        close_to_zxdq_max_mult: float | None = None,
+        daily_basic_volume_ratio_min: float | None = None,
+        daily_basic_volume_ratio_max: float | None = None,
+        require_moneyflow_3d_net_inflow: bool = False,
+        require_moneyflow_3d_large_net_inflow: bool = False,
+        moneyflow_lookback_days: int = 3,
+        require_sw_strength: bool = False,
+        sw_strength_quantile_min: float = 0.5,
+        require_sw_positive: bool = True,
+        use_score_model: bool = False,
+        top_n: int | None = None,
+        daily_trade_cap: int | None = None,
+        score_weights: Dict[str, float] | None = None,
+        score_moneyflow_lookback_days: int = 3,
     ) -> None:
         if min_history < 20:
             raise ValueError("min_history 应 >= 20")
@@ -1103,6 +1123,34 @@ class ZXBrickTurnSelector:
             raise ValueError("m1~m4 应 >= 2")
         if strong_red_ratio < 0:
             raise ValueError("strong_red_ratio 应 >= 0")
+        if moneyflow_lookback_days < 1:
+            raise ValueError("moneyflow_lookback_days 应 >= 1")
+        if score_moneyflow_lookback_days < 1:
+            raise ValueError("score_moneyflow_lookback_days 应 >= 1")
+        if not (0.0 <= sw_strength_quantile_min <= 1.0):
+            raise ValueError("sw_strength_quantile_min 应位于 [0,1]")
+        if (
+            t_day_pct_min is not None
+            and t_day_pct_max is not None
+            and t_day_pct_min > t_day_pct_max
+        ):
+            raise ValueError("t_day_pct_min 不应大于 t_day_pct_max")
+        if close_near_high_max is not None and close_near_high_max < 0:
+            raise ValueError("close_near_high_max 应 >= 0")
+        if body_ratio_min is not None and not (0 <= body_ratio_min <= 1):
+            raise ValueError("body_ratio_min 应位于 [0,1]")
+        if close_to_zxdq_max_mult is not None and close_to_zxdq_max_mult <= 0:
+            raise ValueError("close_to_zxdq_max_mult 应 > 0")
+        if (
+            daily_basic_volume_ratio_min is not None
+            and daily_basic_volume_ratio_max is not None
+            and daily_basic_volume_ratio_min > daily_basic_volume_ratio_max
+        ):
+            raise ValueError("daily_basic_volume_ratio_min 不应大于 daily_basic_volume_ratio_max")
+        if top_n is not None and top_n < 1:
+            raise ValueError("top_n 应 >= 1 或 None")
+        if daily_trade_cap is not None and daily_trade_cap < 1:
+            raise ValueError("daily_trade_cap 应 >= 1 或 None")
 
         self.brick_window = int(brick_window)
         self.var2_sma_n = int(var2_sma_n)
@@ -1116,23 +1164,255 @@ class ZXBrickTurnSelector:
         self.min_history = int(min_history)
         self.max_window = int(max_window)
         self.strong_red_ratio = float(strong_red_ratio)
+        self.aux_data_dir = Path(aux_data_dir) if aux_data_dir else None
 
-    def _passes_filters(self, hist: pd.DataFrame) -> bool:
-        if hist is None or hist.empty:
+        self.t_day_pct_min = t_day_pct_min
+        self.t_day_pct_max = t_day_pct_max
+        self.close_near_high_max = close_near_high_max
+        self.body_ratio_min = body_ratio_min
+        self.close_to_zxdq_max_mult = close_to_zxdq_max_mult
+        self.daily_basic_volume_ratio_min = daily_basic_volume_ratio_min
+        self.daily_basic_volume_ratio_max = daily_basic_volume_ratio_max
+        self.require_moneyflow_3d_net_inflow = bool(require_moneyflow_3d_net_inflow)
+        self.require_moneyflow_3d_large_net_inflow = bool(require_moneyflow_3d_large_net_inflow)
+        self.moneyflow_lookback_days = int(moneyflow_lookback_days)
+        self.require_sw_strength = bool(require_sw_strength)
+        self.sw_strength_quantile_min = float(sw_strength_quantile_min)
+        self.require_sw_positive = bool(require_sw_positive)
+
+        self.use_score_model = bool(use_score_model)
+        self.top_n = int(top_n) if top_n is not None else None
+        self.daily_trade_cap = int(daily_trade_cap) if daily_trade_cap is not None else None
+        self.score_moneyflow_lookback_days = int(score_moneyflow_lookback_days)
+        self.score_weights = self._normalize_score_weights(score_weights)
+
+        self._lru_size = 32
+        self._daily_basic_volume_ratio_cache: OrderedDict[str, Dict[str, float]] = OrderedDict()
+        self._moneyflow_cache: OrderedDict[str, Dict[str, tuple[float, float]]] = OrderedDict()
+        self._sw_daily_cache: OrderedDict[str, tuple[Dict[str, float], float]] = OrderedDict()
+        self._code_to_industry_l1: Dict[str, str] = {}
+        if self.aux_data_dir is not None:
+            self._load_aux_meta()
+
+    @staticmethod
+    def _to_ts_code(code: str) -> str:
+        c = str(code).zfill(6)
+        if c.startswith(("60", "68", "9")):
+            return f"{c}.SH"
+        if c.startswith(("4", "8")):
+            return f"{c}.BJ"
+        return f"{c}.SZ"
+
+    @staticmethod
+    def _to_trade_date_str(value: pd.Timestamp) -> str:
+        return pd.Timestamp(value).strftime("%Y%m%d")
+
+    @staticmethod
+    def _normalize_score_weights(score_weights: Dict[str, float] | None) -> Dict[str, float]:
+        default = {
+            "brick_strength": 0.35,
+            "volume_ratio": 0.25,
+            "moneyflow_strength": 0.20,
+            "industry_strength": 0.20,
+        }
+        if not score_weights:
+            return default
+
+        key_map = {
+            "brick": "brick_strength",
+            "brick_strength": "brick_strength",
+            "volume": "volume_ratio",
+            "volume_ratio": "volume_ratio",
+            "moneyflow": "moneyflow_strength",
+            "moneyflow_strength": "moneyflow_strength",
+            "industry": "industry_strength",
+            "industry_strength": "industry_strength",
+        }
+        out = {k: 0.0 for k in default}
+        for k, v in score_weights.items():
+            canonical = key_map.get(str(k), None)
+            if canonical is None:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if np.isfinite(fv) and fv > 0:
+                out[canonical] += fv
+        total = float(sum(out.values()))
+        if total <= 0:
+            return default
+        return {k: float(v / total) for k, v in out.items()}
+
+    def _put_lru(self, cache: OrderedDict, key: str, value: Any) -> None:
+        cache[key] = value
+        cache.move_to_end(key, last=True)
+        while len(cache) > self._lru_size:
+            cache.popitem(last=False)
+
+    def _load_aux_meta(self) -> None:
+        if self.aux_data_dir is None:
+            return
+        fp = self.aux_data_dir / "meta" / "index_member_all.csv"
+        if not fp.exists():
+            return
+        try:
+            df = pd.read_csv(fp, usecols=["ts_code", "l1_name"])
+        except Exception:
+            return
+
+        ts_codes = df["ts_code"].astype(str).str.upper()
+        l1_names = df["l1_name"].astype(str)
+        for ts_code, l1_name in zip(ts_codes, l1_names):
+            if ts_code and l1_name and l1_name != "nan":
+                self._code_to_industry_l1[ts_code] = l1_name
+
+    def _get_daily_basic_volume_ratio(self, trade_date: str) -> Dict[str, float]:
+        if trade_date in self._daily_basic_volume_ratio_cache:
+            self._daily_basic_volume_ratio_cache.move_to_end(trade_date, last=True)
+            return self._daily_basic_volume_ratio_cache[trade_date]
+
+        out: Dict[str, float] = {}
+        if self.aux_data_dir is not None:
+            fp = self.aux_data_dir / "daily_basic" / f"{trade_date}.csv"
+            if fp.exists():
+                try:
+                    df = pd.read_csv(fp, usecols=["ts_code", "volume_ratio"])
+                    ts_codes = df["ts_code"].astype(str).str.upper()
+                    volume_ratio = pd.to_numeric(df["volume_ratio"], errors="coerce")
+                    for ts_code, vr in zip(ts_codes, volume_ratio):
+                        if np.isfinite(vr):
+                            out[ts_code] = float(vr)
+                except Exception:
+                    out = {}
+
+        self._put_lru(self._daily_basic_volume_ratio_cache, trade_date, out)
+        return out
+
+    def _get_moneyflow_map(self, trade_date: str) -> Dict[str, tuple[float, float]]:
+        if trade_date in self._moneyflow_cache:
+            self._moneyflow_cache.move_to_end(trade_date, last=True)
+            return self._moneyflow_cache[trade_date]
+
+        out: Dict[str, tuple[float, float]] = {}
+        if self.aux_data_dir is not None:
+            fp = self.aux_data_dir / "moneyflow" / f"{trade_date}.csv"
+            if fp.exists():
+                try:
+                    df = pd.read_csv(
+                        fp,
+                        usecols=[
+                            "ts_code",
+                            "net_mf_amount",
+                            "buy_lg_amount",
+                            "sell_lg_amount",
+                            "buy_elg_amount",
+                            "sell_elg_amount",
+                        ],
+                    )
+                    ts_codes = df["ts_code"].astype(str).str.upper()
+                    net_mf = pd.to_numeric(df["net_mf_amount"], errors="coerce")
+                    buy_lg = pd.to_numeric(df["buy_lg_amount"], errors="coerce")
+                    sell_lg = pd.to_numeric(df["sell_lg_amount"], errors="coerce")
+                    buy_elg = pd.to_numeric(df["buy_elg_amount"], errors="coerce")
+                    sell_elg = pd.to_numeric(df["sell_elg_amount"], errors="coerce")
+
+                    for ts_code, n, bl, sl, be, se in zip(ts_codes, net_mf, buy_lg, sell_lg, buy_elg, sell_elg):
+                        if not np.isfinite(n):
+                            continue
+                        large_net = 0.0
+                        if np.isfinite(bl):
+                            large_net += float(bl)
+                        if np.isfinite(be):
+                            large_net += float(be)
+                        if np.isfinite(sl):
+                            large_net -= float(sl)
+                        if np.isfinite(se):
+                            large_net -= float(se)
+                        out[ts_code] = (float(n), float(large_net))
+                except Exception:
+                    out = {}
+
+        self._put_lru(self._moneyflow_cache, trade_date, out)
+        return out
+
+    def _get_sw_strength(self, trade_date: str) -> tuple[Dict[str, float], float]:
+        if trade_date in self._sw_daily_cache:
+            self._sw_daily_cache.move_to_end(trade_date, last=True)
+            return self._sw_daily_cache[trade_date]
+
+        industry_pct: Dict[str, float] = {}
+        q_value = float("nan")
+        if self.aux_data_dir is not None:
+            fp = self.aux_data_dir / "sw_daily" / f"{trade_date}.csv"
+            if fp.exists():
+                try:
+                    df = pd.read_csv(fp, usecols=["name", "pct_change"])
+                    names = df["name"].astype(str)
+                    pct = pd.to_numeric(df["pct_change"], errors="coerce")
+                    valid_pct = pct.dropna().to_numpy(dtype=float)
+                    if len(valid_pct) > 0:
+                        q_value = float(np.quantile(valid_pct, self.sw_strength_quantile_min))
+                    for name, p in zip(names, pct):
+                        if np.isfinite(p):
+                            industry_pct[name] = float(p)
+                except Exception:
+                    industry_pct = {}
+                    q_value = float("nan")
+
+        self._put_lru(self._sw_daily_cache, trade_date, (industry_pct, q_value))
+        return industry_pct, q_value
+
+    @staticmethod
+    def _audit_should_append(audit_level: str, passed: bool) -> bool:
+        if audit_level == "off":
             return False
-        hist = hist.sort_values("date").copy()
+        if audit_level == "full":
+            return True
+        return (not passed)
+
+    def _append_rule_audit(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        audit_level: str,
+        code: str,
+        ts_code: str,
+        rule_code: str,
+        rule_name: str,
+        passed: bool,
+        actual_value: Any,
+        threshold_expr: str,
+        reason: str,
+    ) -> None:
+        if not self._audit_should_append(audit_level, passed):
+            return
+        rows.append(
+            {
+                "stage": "hard_filter",
+                "code": code,
+                "ts_code": ts_code,
+                "rule_code": rule_code,
+                "rule_name": rule_name,
+                "passed": bool(passed),
+                "actual_value": actual_value,
+                "threshold_expr": threshold_expr,
+                "reason": reason,
+            }
+        )
+
+    def _core_signal_eval(self, hist: pd.DataFrame) -> Dict[str, Any]:
         if len(hist) < self.min_history:
-            return False
+            return {"passed": False}
 
-        # 条件1：收盘 > 黄线，白线 > 黄线
         zxdq, zxdkx = compute_zx_lines(hist, m1=self.m1, m2=self.m2, m3=self.m3, m4=self.m4)
         c = float(hist["close"].iloc[-1])
         s = float(zxdq.iloc[-1])
         l = float(zxdkx.iloc[-1]) if pd.notna(zxdkx.iloc[-1]) else float("nan")
         if not (np.isfinite(c) and np.isfinite(s) and np.isfinite(l)):
-            return False
+            return {"passed": False}
         if not (c > l and s > l):
-            return False
+            return {"passed": False}
 
         brick_df = compute_brick_turn_signal(
             hist,
@@ -1142,42 +1422,487 @@ class ZXBrickTurnSelector:
             var5_sma_n=self.var5_sma_n,
             brick_threshold=self.brick_threshold,
         )
-        if brick_df.empty:
-            return False
+        if brick_df.empty or len(brick_df) < 3:
+            return {"passed": False}
+        if not bool(brick_df["aa"].iloc[-1]):
+            return {"passed": False}
+        if not bool(brick_df["bb"].iloc[-2]):
+            return {"passed": False}
 
-        # 条件2：T-1 绿砖，T 红砖
-        if len(brick_df) < 3:
-            return False
-        if not bool(brick_df["aa"].iloc[-1]):   # T 红砖
-            return False
-        if not bool(brick_df["bb"].iloc[-2]):   # T-1 绿砖
-            return False
-
-        # 红砖高度 >= strong_red_ratio * 绿砖高度
         red_height = float(brick_df["brick"].iloc[-1] - brick_df["brick"].iloc[-2])
         green_height = float(brick_df["brick"].iloc[-3] - brick_df["brick"].iloc[-2])
         if red_height <= 0 or green_height <= 0:
-            return False
+            return {"passed": False}
         if red_height < self.strong_red_ratio * green_height:
-            return False
+            return {"passed": False}
 
-        return True
+        brick_strength = float(red_height / (green_height + 1e-9))
+        return {
+            "passed": True,
+            "close": c,
+            "short_line": s,
+            "long_line": l,
+            "brick_strength": brick_strength,
+            "red_height": red_height,
+            "green_height": green_height,
+        }
+
+    def _calc_moneyflow_sum(
+        self,
+        *,
+        ts_code: str,
+        hist_dates: pd.Series,
+        lookback_days: int,
+    ) -> tuple[bool, float, float]:
+        tail_dates = hist_dates.tail(lookback_days)
+        if len(tail_dates) < lookback_days:
+            return False, float("nan"), float("nan")
+        net_sum = 0.0
+        large_sum = 0.0
+        for d in tail_dates:
+            td = self._to_trade_date_str(pd.Timestamp(d))
+            values = self._get_moneyflow_map(td).get(ts_code)
+            if values is None:
+                return False, float("nan"), float("nan")
+            net_sum += values[0]
+            large_sum += values[1]
+        return True, float(net_sum), float(large_sum)
+
+    @staticmethod
+    def _to_percentile_map(values_by_code: Dict[str, float]) -> Dict[str, float]:
+        valid = {k: float(v) for k, v in values_by_code.items() if np.isfinite(v)}
+        if not valid:
+            return {}
+        s = pd.Series(valid)
+        ranks = s.rank(method="average", pct=True)
+        return {str(k): float(v) for k, v in ranks.items()}
+
+    def _score_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not candidates:
+            return []
+        if not self.use_score_model:
+            for c in candidates:
+                c["score"] = float(c.get("brick_strength", 0.0))
+            return candidates
+
+        brick_raw = {c["code"]: float(c.get("brick_strength", float("nan"))) for c in candidates}
+        volume_raw = {c["code"]: float(c.get("volume_ratio", float("nan"))) for c in candidates}
+        money_raw = {c["code"]: float(c.get("moneyflow_net_sum_for_score", float("nan"))) for c in candidates}
+        industry_raw = {c["code"]: float(c.get("industry_pct", float("nan"))) for c in candidates}
+
+        brick_rank = self._to_percentile_map(brick_raw)
+        volume_rank = self._to_percentile_map(volume_raw)
+        money_rank = self._to_percentile_map(money_raw)
+        industry_rank = self._to_percentile_map(industry_raw)
+
+        for c in candidates:
+            code = c["code"]
+            brick_s = brick_rank.get(code, 0.5)
+            volume_s = volume_rank.get(code, 0.5)
+            money_s = money_rank.get(code, 0.5)
+            industry_s = industry_rank.get(code, 0.5)
+
+            score = (
+                self.score_weights["brick_strength"] * brick_s
+                + self.score_weights["volume_ratio"] * volume_s
+                + self.score_weights["moneyflow_strength"] * money_s
+                + self.score_weights["industry_strength"] * industry_s
+            )
+            c["score"] = float(score)
+            c["factor_scores"] = {
+                "brick_strength": float(brick_s),
+                "volume_ratio": float(volume_s),
+                "moneyflow_strength": float(money_s),
+                "industry_strength": float(industry_s),
+            }
+        return candidates
+
+    def _evaluate_hard_filters(
+        self,
+        *,
+        code: str,
+        ts_code: str,
+        trade_date: str,
+        hist: pd.DataFrame,
+        core: Dict[str, Any],
+        audit_level: str,
+    ) -> tuple[bool, List[Dict[str, Any]], Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        metrics: Dict[str, Any] = {}
+
+        today = hist.iloc[-1]
+        prev = hist.iloc[-2] if len(hist) >= 2 else None
+        c = float(today["close"])
+        o = float(today["open"])
+        h = float(today["high"])
+        l = float(today["low"])
+        day_range = h - l
+
+        if self.t_day_pct_min is not None or self.t_day_pct_max is not None:
+            prev_close = float(prev["close"]) if prev is not None else float("nan")
+            pct_chg = float("nan")
+            passed = False
+            reason = "前一日收盘无效"
+            if np.isfinite(prev_close) and prev_close > 0:
+                pct_chg = c / prev_close - 1.0
+                lo = self.t_day_pct_min if self.t_day_pct_min is not None else -np.inf
+                hi = self.t_day_pct_max if self.t_day_pct_max is not None else np.inf
+                passed = bool(lo <= pct_chg <= hi)
+                reason = "" if passed else "涨幅不在允许区间"
+            metrics["pct_chg"] = pct_chg
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_PCT_RANGE",
+                rule_name="T日涨幅区间",
+                passed=passed,
+                actual_value=pct_chg,
+                threshold_expr=f"{self.t_day_pct_min} <= pct_chg <= {self.t_day_pct_max}",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+        if self.close_near_high_max is not None:
+            close_near_high = float("nan")
+            passed = False
+            reason = "当日振幅无效"
+            if np.isfinite(day_range) and day_range > 0:
+                close_near_high = (h - c) / day_range
+                passed = bool(close_near_high <= self.close_near_high_max)
+                reason = "" if passed else "收盘距离最高点过远"
+            metrics["close_near_high"] = close_near_high
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_CLOSE_NEAR_HIGH",
+                rule_name="收盘接近日高",
+                passed=passed,
+                actual_value=close_near_high,
+                threshold_expr=f"(high-close)/(high-low) <= {self.close_near_high_max}",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+        if self.body_ratio_min is not None:
+            body_ratio = float("nan")
+            passed = False
+            reason = "当日振幅无效"
+            if np.isfinite(day_range) and day_range > 0:
+                body_ratio = abs(c - o) / day_range
+                passed = bool(body_ratio >= self.body_ratio_min)
+                reason = "" if passed else "实体占比不足"
+            metrics["body_ratio"] = body_ratio
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_BODY_RATIO",
+                rule_name="实体占比下限",
+                passed=passed,
+                actual_value=body_ratio,
+                threshold_expr=f"abs(close-open)/(high-low) >= {self.body_ratio_min}",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+        if self.close_to_zxdq_max_mult is not None:
+            short_line = float(core.get("short_line", float("nan")))
+            ratio = float("nan")
+            passed = False
+            reason = "短线值无效"
+            if np.isfinite(short_line) and short_line > 0:
+                ratio = c / short_line
+                passed = bool(ratio <= self.close_to_zxdq_max_mult)
+                reason = "" if passed else "短线乖离过热"
+            metrics["close_to_zxdq"] = ratio
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_ZXDQ_OVERHEAT",
+                rule_name="短线乖离不过热",
+                passed=passed,
+                actual_value=ratio,
+                threshold_expr=f"close/zxdq <= {self.close_to_zxdq_max_mult}",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+        volume_ratio = float("nan")
+        if self.daily_basic_volume_ratio_min is not None or self.daily_basic_volume_ratio_max is not None:
+            volume_ratio = self._get_daily_basic_volume_ratio(trade_date).get(ts_code, float("nan"))
+            passed = bool(np.isfinite(volume_ratio))
+            reason = "" if passed else "缺少 daily_basic.volume_ratio"
+            if passed:
+                if self.daily_basic_volume_ratio_min is not None and volume_ratio < self.daily_basic_volume_ratio_min:
+                    passed = False
+                    reason = "量比低于下限"
+                if self.daily_basic_volume_ratio_max is not None and volume_ratio > self.daily_basic_volume_ratio_max:
+                    passed = False
+                    reason = "量比高于上限"
+            metrics["volume_ratio"] = volume_ratio
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_VOLUME_RATIO",
+                rule_name="量比区间",
+                passed=passed,
+                actual_value=volume_ratio,
+                threshold_expr=f"{self.daily_basic_volume_ratio_min} <= volume_ratio <= {self.daily_basic_volume_ratio_max}",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+        metrics["volume_ratio"] = volume_ratio
+
+        mf_ok, mf_net_sum, mf_large_sum = self._calc_moneyflow_sum(
+            ts_code=ts_code,
+            hist_dates=hist["date"],
+            lookback_days=self.moneyflow_lookback_days,
+        )
+        metrics["moneyflow_net_sum_hard"] = mf_net_sum
+        metrics["moneyflow_large_sum_hard"] = mf_large_sum
+        if self.require_moneyflow_3d_net_inflow:
+            passed = bool(mf_ok and np.isfinite(mf_net_sum) and mf_net_sum > 0)
+            reason = "" if passed else "近3日净流入和不为正或缺失"
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_MONEYFLOW_3D_NET",
+                rule_name="3日净流入为正",
+                passed=passed,
+                actual_value=mf_net_sum,
+                threshold_expr="moneyflow_3d_net_sum > 0",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+        if self.require_moneyflow_3d_large_net_inflow:
+            passed = bool(mf_ok and np.isfinite(mf_large_sum) and mf_large_sum > 0)
+            reason = "" if passed else "近3日大单净流入和不为正或缺失"
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_MONEYFLOW_3D_LARGE",
+                rule_name="3日大单净流入为正",
+                passed=passed,
+                actual_value=mf_large_sum,
+                threshold_expr="moneyflow_3d_large_net_sum > 0",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+        industry_pct = float("nan")
+        industry_q = float("nan")
+        industry_name = ""
+        if self.require_sw_strength:
+            industry_map, industry_q = self._get_sw_strength(trade_date)
+            industry_name = self._code_to_industry_l1.get(ts_code, "")
+            if industry_name:
+                industry_pct = float(industry_map.get(industry_name, float("nan")))
+
+            passed = bool(industry_name and np.isfinite(industry_pct) and np.isfinite(industry_q) and industry_pct >= industry_q)
+            reason = "" if passed else "行业强度低于分位阈值或缺失"
+            self._append_rule_audit(
+                rows,
+                audit_level=audit_level,
+                code=code,
+                ts_code=ts_code,
+                rule_code="HF_SW_STRENGTH",
+                rule_name="行业强度分位",
+                passed=passed,
+                actual_value=industry_pct,
+                threshold_expr=f"industry_pct >= q({self.sw_strength_quantile_min})",
+                reason=reason,
+            )
+            if not passed:
+                return False, rows, metrics
+
+            if self.require_sw_positive:
+                passed = bool(np.isfinite(industry_pct) and industry_pct > 0)
+                reason = "" if passed else "行业涨幅不为正"
+                self._append_rule_audit(
+                    rows,
+                    audit_level=audit_level,
+                    code=code,
+                    ts_code=ts_code,
+                    rule_code="HF_SW_POSITIVE",
+                    rule_name="行业涨幅为正",
+                    passed=passed,
+                    actual_value=industry_pct,
+                    threshold_expr="industry_pct > 0",
+                    reason=reason,
+                )
+                if not passed:
+                    return False, rows, metrics
+
+        metrics["industry_name"] = industry_name
+        metrics["industry_pct"] = industry_pct
+        metrics["industry_q"] = industry_q
+        return True, rows, metrics
+
+    def _build_hist_until_date(self, df: pd.DataFrame, date: pd.Timestamp) -> Optional[pd.DataFrame]:
+        if df is None or df.empty:
+            return None
+        df_sorted = df.sort_values("date").reset_index(drop=True)
+        idx = df_sorted.index[df_sorted["date"] == date]
+        if len(idx) == 0:
+            return None
+        pos = int(idx[-1])
+        need_len = max(self.min_history, self.max_window)
+        hist = df_sorted.iloc[max(0, pos - need_len + 1): pos + 1]
+        if len(hist) < self.min_history:
+            return None
+        return hist
+
+    def select_with_audit(
+        self,
+        date: pd.Timestamp,
+        data: Dict[str, pd.DataFrame],
+        audit_level: str = "failed_only",
+    ) -> Dict[str, Any]:
+        if audit_level not in {"off", "failed_only", "full"}:
+            raise ValueError("audit_level 必须为 off/failed_only/full")
+
+        core_pass_count = 0
+        hard_pass_count = 0
+        audit_rows: List[Dict[str, Any]] = []
+        candidates: List[Dict[str, Any]] = []
+
+        for code, df in data.items():
+            hist = self._build_hist_until_date(df, date)
+            if hist is None:
+                continue
+
+            core = self._core_signal_eval(hist)
+            if not bool(core.get("passed", False)):
+                continue
+            core_pass_count += 1
+
+            trade_date = self._to_trade_date_str(pd.Timestamp(hist["date"].iloc[-1]))
+            ts_code = self._to_ts_code(code)
+            hard_ok, hard_rows, metrics = self._evaluate_hard_filters(
+                code=code,
+                ts_code=ts_code,
+                trade_date=trade_date,
+                hist=hist,
+                core=core,
+                audit_level=audit_level,
+            )
+            if hard_rows:
+                audit_rows.extend(hard_rows)
+            if not hard_ok:
+                continue
+            hard_pass_count += 1
+
+            mf_ok, mf_net_sum, _ = self._calc_moneyflow_sum(
+                ts_code=ts_code,
+                hist_dates=hist["date"],
+                lookback_days=self.score_moneyflow_lookback_days,
+            )
+            industry_pct = float(metrics.get("industry_pct", float("nan")))
+            if not np.isfinite(industry_pct):
+                industry_name = self._code_to_industry_l1.get(ts_code, "")
+                if industry_name:
+                    industry_map, _ = self._get_sw_strength(trade_date)
+                    industry_pct = float(industry_map.get(industry_name, float("nan")))
+
+            candidates.append(
+                {
+                    "code": str(code),
+                    "ts_code": ts_code,
+                    "brick_strength": float(core["brick_strength"]),
+                    "score": float("nan"),
+                    "volume_ratio": float(metrics.get("volume_ratio", float("nan"))),
+                    "moneyflow_net_sum_for_score": float(mf_net_sum if mf_ok else float("nan")),
+                    "industry_pct": float(industry_pct),
+                }
+            )
+
+        scored = self._score_candidates(candidates)
+        scored_sorted = sorted(
+            scored,
+            key=lambda x: (-float(x.get("score", float("-inf"))), -float(x.get("brick_strength", float("-inf"))), str(x.get("code", ""))),
+        )
+
+        picks_scored: List[Dict[str, Any]] = []
+        for rank, item in enumerate(scored_sorted, start=1):
+            picks_scored.append(
+                {
+                    "code": item["code"],
+                    "ts_code": item["ts_code"],
+                    "score": float(item.get("score", float("nan"))),
+                    "brick_strength": float(item.get("brick_strength", float("nan"))),
+                    "factor_scores": dict(item.get("factor_scores", {})),
+                    "volume_ratio": float(item.get("volume_ratio", float("nan"))),
+                    "moneyflow_net_sum_for_score": float(item.get("moneyflow_net_sum_for_score", float("nan"))),
+                    "industry_pct": float(item.get("industry_pct", float("nan"))),
+                    "rank_before_cap": rank,
+                }
+            )
+
+        ranked = picks_scored
+        if self.top_n is not None:
+            ranked = ranked[: self.top_n]
+
+        cap_reject_count = 0
+        if self.daily_trade_cap is not None and len(ranked) > self.daily_trade_cap:
+            rejected = ranked[self.daily_trade_cap :]
+            cap_reject_count = len(rejected)
+            if audit_level != "off":
+                for item in rejected:
+                    audit_rows.append(
+                        {
+                            "stage": "execution",
+                            "code": item["code"],
+                            "ts_code": item["ts_code"],
+                            "rule_code": "DAILY_CAP",
+                            "rule_name": "每日交易上限",
+                            "passed": False,
+                            "actual_value": int(item["rank_before_cap"]),
+                            "threshold_expr": f"rank <= {self.daily_trade_cap}",
+                            "reason": "超过每日交易上限",
+                            "score": float(item["score"]),
+                            "brick_strength": float(item["brick_strength"]),
+                            "rank_before_cap": int(item["rank_before_cap"]),
+                            "reject_reason": "DAILY_CAP",
+                        }
+                    )
+            ranked = ranked[: self.daily_trade_cap]
+
+        picks_final = [str(x["code"]) for x in ranked]
+        summary = {
+            "core_pass_count": int(core_pass_count),
+            "hard_pass_count": int(hard_pass_count),
+            "selected_count": int(len(picks_final)),
+            "cap_reject_count": int(cap_reject_count),
+        }
+        return {
+            "picks_final": picks_final,
+            "picks_scored": picks_scored,
+            "audit_rows": audit_rows,
+            "audit_summary": summary,
+        }
 
     def select(self, date: pd.Timestamp, data: Dict[str, pd.DataFrame]) -> List[str]:
-        picks: List[str] = []
-        need_len = max(self.min_history, self.max_window)
-        for code, df in data.items():
-            if df is None or df.empty:
-                continue
-            df_sorted = df.sort_values("date").reset_index(drop=True)
-            idx = df_sorted.index[df_sorted["date"] == date]
-            if len(idx) == 0:
-                continue
-            pos = int(idx[-1])
-            hist = df_sorted.iloc[max(0, pos - need_len + 1): pos + 1]
-            if len(hist) < self.min_history:
-                continue
-            if self._passes_filters(hist):
-                picks.append(code)
-        return picks
+        result = self.select_with_audit(date, data, audit_level="off")
+        return list(result.get("picks_final", []))
 

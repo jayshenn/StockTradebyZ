@@ -573,11 +573,36 @@ def backtest_selector(
     daily_buckets: Dict[pd.Timestamp, List[float]] = defaultdict(list)
     trades: List[TradeResult] = []
     picks_per_signal: List[int] = []
+    core_pass_per_signal: List[int] = []
+    hard_pass_per_signal: List[int] = []
+    selected_per_signal: List[int] = []
+    cap_reject_per_signal: List[int] = []
     signal_days = 0
+    cap_binding_days = 0
 
     for signal_date in calendar:
-        picks = selector.select(signal_date, data)
+        if hasattr(selector, "select_with_audit"):
+            select_result = selector.select_with_audit(signal_date, data, audit_level="off")
+            picks = list(select_result.get("picks_final", []))
+            audit_summary = dict(select_result.get("audit_summary", {}))
+            core_cnt = int(audit_summary.get("core_pass_count", len(picks)))
+            hard_cnt = int(audit_summary.get("hard_pass_count", len(picks)))
+            selected_cnt = int(audit_summary.get("selected_count", len(picks)))
+            cap_reject_cnt = int(audit_summary.get("cap_reject_count", 0))
+        else:
+            picks = selector.select(signal_date, data)
+            core_cnt = len(picks)
+            hard_cnt = len(picks)
+            selected_cnt = len(picks)
+            cap_reject_cnt = 0
+
         picks_per_signal.append(len(picks))
+        core_pass_per_signal.append(core_cnt)
+        hard_pass_per_signal.append(hard_cnt)
+        selected_per_signal.append(selected_cnt)
+        cap_reject_per_signal.append(cap_reject_cnt)
+        if cap_reject_cnt > 0:
+            cap_binding_days += 1
         signal_days += 1
         if not picks:
             continue
@@ -626,6 +651,11 @@ def backtest_selector(
         "class": cls_name,
         "signal_days": signal_days,
         "avg_picks_per_signal_day": float(np.mean(picks_per_signal)) if picks_per_signal else 0.0,
+        "avg_core_pass_per_day": float(np.mean(core_pass_per_signal)) if core_pass_per_signal else 0.0,
+        "avg_hard_pass_per_day": float(np.mean(hard_pass_per_signal)) if hard_pass_per_signal else 0.0,
+        "avg_selected_per_day": float(np.mean(selected_per_signal)) if selected_per_signal else 0.0,
+        "avg_cap_reject_per_day": float(np.mean(cap_reject_per_signal)) if cap_reject_per_signal else 0.0,
+        "cap_binding_ratio": float(cap_binding_days / signal_days) if signal_days > 0 else 0.0,
         "exit_mode": exit_mode,
         "hold_days": hold_days,
         "max_hold_days": max_hold_days if exit_mode == "adaptive" else None,

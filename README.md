@@ -1,8 +1,8 @@
 # Z哥战法的 Python 实现（更新版）
 
-> **更新时间：2026-03-02** –
+> **更新时间：2026-03-04** –
 >
-> 新增 **ZXBrickTurnSelector（搬砖战法）**：用于捕捉短期“砖型图”由弱转强的拐点信号（XG）。
+> 新增 **ZXBrickTurnSelector v3**：支持 `hard_filter + score_model + daily_trade_cap`，并提供过滤/执行审计与权重网格搜索脚本。
 
 ---
 
@@ -17,6 +17,7 @@
   * [下载历史 K 线（qfq，日线）](#下载历史-k-线qfq日线)
   * [运行选股](#运行选股)
   * [运行回测](#运行回测)
+  * [ZXBrick v3 权重网格搜索](#zxbrick-v3-权重网格搜索)
 * [参数说明](#参数说明)
 
   * [`fetch_kline.py`](#fetch_klinepy)
@@ -34,6 +35,8 @@
   * [7. ZXBrickTurnSelector（搬砖战法）](#7-zxbrickturnselector搬砖战法)
 
 * [策略流程图（Mermaid）](#策略流程图mermaid)
+* [实盘执行手册](#实盘执行手册)
+* [每日操作清单（一页版）](#每日操作清单一页版)
 * [项目结构](#项目结构)
 * [常见问题](#常见问题)
 * [免责声明](#免责声明)
@@ -45,7 +48,10 @@
 | 名称                    | 功能简介                                                                                                                                                                               |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`scripts/fetch_kline.py`**  | 仅使用 **Tushare** 抓取 **A 股日线（前复权 qfq）**。股票池从 `configs/stocklist.csv` 读取，支持排除 **创业板/科创板/北交所**，并发抓取，默认按股票 **增量更新**（仅补新日期，保留历史），输出 CSV 列：`date, open, close, high, low, volume`。 |
-| **`scripts/select_stock.py`** | 加载 `./data` 目录内 CSV 行情与 `configs/configs.json`，批量执行选择器（Selector），输出到控制台与 `logs/select_results.log`，并将结果落盘到 `./out`（JSON + CSV）。                                                                                           |
+| **`scripts/select_stock.py`** | 加载 `./data` 目录内 CSV 行情与配置，批量执行选择器（Selector），支持 `--audit` 输出硬过滤失败与执行淘汰（daily cap）审计文件。 |
+| **`scripts/backtest_selectors.py`** | 按交易日逐日回放 selector 选股，支持固定/自适应离场；若 selector 支持 `select_with_audit`，回测与选股端使用同一最终入选口径。 |
+| **`scripts/fetch_aux_data.py`** | 批量抓取 `daily_basic/moneyflow/sw_daily` 等辅助数据至 `data_aux`，供 ZXBrick 增强过滤与评分使用。 |
+| **`scripts/grid_search_zxbrick_v3.py`** | 对 ZXBrick v3 执行权重网格搜索，并输出 `hard_filter` 与 `DAILY_CAP` 高频失败原因榜。 |
 | **`core/selector.py`**     | 实现各类战法（选择器）。**已删除 TePu 战法**；现包含 7 个策略。多数策略包含“当日过滤 & 知行约束”，搬砖战法支持按参数启停。                                                                                                                           |
 
 ---
@@ -112,15 +118,44 @@ python scripts/fetch_kline.py \
 ```bash
 python scripts/select_stock.py \
   --data-dir ./data \
-  --config ./configs/configs.json \
+  --config ./configs/backtest_brick_compare_aux_top2.json \
   --date 2026-03-03 \
+  --audit failed_only \
   --out-dir ./out
 ```
 
 > `--date` 可省略，默认取数据中的最后交易日。
 >
-> 每次运行会在 `--out-dir` 下生成 3 个文件：
-> `select_results_*.json`、`select_results_summary_*.csv`、`select_results_detail_*.csv`。
+> 每次运行会在 `--out-dir` 下生成结果与审计文件：
+> `select_results_*.json`、`select_results_summary_*.csv`、`select_results_detail_*.csv`、`select_filter_audit_*.csv/json`、`select_execution_audit_*.csv/json`。
+
+### ZXBrick v3 权重网格搜索
+
+```bash
+python scripts/grid_search_zxbrick_v3.py \
+  --data-dir ./data \
+  --config ./configs/backtest_brick_compare_aux_top2.json \
+  --selector-alias 搬砖_增强v3_top2 \
+  --start-date 2025-01-01 \
+  --end-date 2026-03-03 \
+  --entry-price open \
+  --hold-days 2 \
+  --daily-trade-cap 2 \
+  --grid-values 0.1,0.15,0.2,0.25,0.3,0.35,0.4 \
+  --top-k 30 \
+  --audit-top-n 30 \
+  --out-dir ./out
+```
+
+> 产出包括：`grid_search_zxbrick_v3_*_summary.csv`、`*_top30.csv`、`*_best.json`、以及 hard filter / cap reject 榜单 CSV。
+
+## 实盘执行手册
+
+- 见文档：`docs/zxbrick-v3-ops-playbook.md`
+
+## 每日操作清单（一页版）
+
+- 见文档：`docs/zxbrick-v3-daily-checklist.md`
 
 ### 运行回测
 
@@ -188,6 +223,7 @@ python scripts/backtest_selectors.py \
 | `--data-dir` | `./data`         | CSV 行情目录 |
 | `--config`   | `./configs/configs.json` | 选择器配置    |
 | `--date`     | 数据最后交易日          | 选股交易日    |
+| `--audit`    | `failed_only`    | 审计级别：`off/failed_only/full` |
 | `--out-dir`  | `./out`          | 结果落盘目录（JSON + CSV） |
 
 ### `backtest_selectors.py`
@@ -232,7 +268,11 @@ python scripts/backtest_selectors.py \
 当前代码口径：
 
 - 前 6 个策略（`BBIKDJ / SuperB1 / BBIShortLong / PeakKDJ / MA60CrossVolumeWave / BigBullishVolume`）默认都会走“当日过滤 + 知行约束”；
-- `ZXBrickTurnSelector（搬砖战法）` 仅按 v2026 两条规则过滤：`close>黄线 && 白线>黄线`，以及 `T-1绿/T红且红砖>=2/3绿砖`。
+- `ZXBrickTurnSelector（搬砖战法）` 默认核心信号为：`close>黄线 && 白线>黄线`、`T-1绿/T红`、`红砖强度达标`；
+- 开启增强参数后可叠加：
+  - `hard_filter`（涨幅区间、收盘接近日高、实体占比、量比、3日资金、行业强度）；
+  - `score_model`（砖强度/量比/资金/行业加权）；
+  - `daily_trade_cap`（每策略每日最多 N 笔，默认在增强配置中常用 `2`）。
 
 ---
 
@@ -463,9 +503,14 @@ python scripts/backtest_selectors.py \
 4. 红砖力度：
    `red_height(T) >= strong_red_ratio * green_height(T-1)`，
    默认 `strong_red_ratio = 2/3`（红砖高度至少是绿砖的三分之二）；
-5. 不叠加其他附加过滤条件。
+5. （可选）硬过滤：
+   `T日涨幅区间 + K线质量 + 量比 + 3日资金 + 行业强度`；
+6. （可选）评分排序：
+   `score = w1*brick + w2*volume + w3*moneyflow + w4*industry`；
+7. （可选）执行纪律：
+   `daily_trade_cap`（例如每策略每日最多 2 笔），超额候选进入 `DAILY_CAP` 审计。
 
-`configs/configs.json` 预设：
+基础配置示例（核心信号）：
 
 ```json
 {
@@ -488,6 +533,11 @@ python scripts/backtest_selectors.py \
   }
 }
 ```
+
+增强配置示例（v3）见：
+
+- `configs/backtest_brick_compare_aux_top2.json`
+- `docs/tushare-aux-data-research-2026-03-04.md`
 
 
 ---
@@ -588,7 +638,10 @@ flowchart TD
     B --> C[知行过滤 close>黄线 且 白线>黄线]
     C --> D[T-1 绿 T 红]
     D --> E[强红 red>=2/3*green]
-    E --> F[入选]
+    E --> F[可选 hard_filter]
+    F --> G[可选 score 排序]
+    G --> H[可选 daily_trade_cap 截断]
+    H --> I[入选]
 ```
 
 ---
@@ -601,16 +654,22 @@ flowchart TD
 ├── configs/
 │   ├── configs.json         # 选择器参数
 │   ├── configs.template.json
-│   └── stocklist.csv        # 股票池（示例列：ts_code/symbol/...）
+│   ├── stocklist.csv        # 股票池（示例列：ts_code/symbol/...）
+│   └── backtest_brick_compare_aux_top2.json  # 搬砖 v3 对比配置（top2）
 ├── core/
 │   └── selector.py          # 策略实现（含公共指标/过滤）
 ├── scripts/
 │   ├── fetch_kline.py       # 抓取入口
+│   ├── fetch_aux_data.py    # 抓取辅助数据（data_aux）
 │   ├── select_stock.py      # 选股入口
+│   ├── backtest_selectors.py # 回测入口
+│   ├── grid_search_zxbrick_v3.py # v3 权重网格 + 失败原因榜
 │   ├── SectorShift.py       # 行业分布分析
 │   └── find_stock_by_price_concurrent.py
 ├── data/                    # 行情 CSV 输出目录
-├── out/                     # 选股落盘结果（JSON + CSV）
+├── data_aux/                # 辅助数据目录（daily_basic/moneyflow/sw_daily...）
+├── docs/                    # 研究与实验文档
+├── out/                     # 选股/回测/网格搜索输出目录
 └── logs/                    # 运行日志目录（fetch/select）
 ```
 
