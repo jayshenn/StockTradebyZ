@@ -96,27 +96,13 @@
         "var4_sma_n": 6,
         "var5_sma_n": 6,
         "brick_threshold": 4.0,
+        "m1": 14,
+        "m2": 28,
+        "m3": 57,
+        "m4": 114,
         "min_history": 140,
         "max_window": 180,
-        "require_close_gt_long": true,
-        "require_short_gt_long": true,
-        "require_low_gt_long": false,
-        "max_close_to_short_mult": 1.09,
-        "max_low_to_short_mult": 1.02,
-        "require_brick_positive": true,
-        "min_brick_increase": 0.5,
-        "apply_day_constraints": false,
-        "next_open_chase_pct_max": null,
-        "allow_no_next_bar": true,
-        "require_prev_green": true,
-        "require_strong_red": true,
-        "strong_red_ratio": 1.15,
-        "require_pre_green_context": true,
-        "pre_turn_window": 5,
-        "min_pre_green_ratio": 0.6,
-        "green_ratio_window": 4,
-        "min_green_ratio": 0.75,
-        "require_recent_green_ratio": true
+        "strong_red_ratio": 0.6666666667
       }
     }
   ]

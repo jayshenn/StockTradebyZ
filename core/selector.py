@@ -286,6 +286,10 @@ def passes_day_constraints_today(df: pd.DataFrame, pct_limit: float = 0.02, amp_
 def zx_condition_at_positions(
     df: pd.DataFrame,
     *,
+    m1: int = 14,
+    m2: int = 28,
+    m3: int = 57,
+    m4: int = 114,
     require_close_gt_long: bool = True,
     require_short_gt_long: bool = True,
     require_low_gt_long: bool = False,
@@ -295,6 +299,8 @@ def zx_condition_at_positions(
 ) -> bool:
     """
     在指定位置 pos（iloc 位置；None 表示当日）检查知行条件：
+      - 白线：EMA(EMA(C,10),10)
+      - 黄线：(MA(C,m1)+MA(C,m2)+MA(C,m3)+MA(C,m4))/4
       - 收盘 > 长期线（可选）
       - 短期线 > 长期线（可选）
       - 最低价 > 长期线（可选）
@@ -304,7 +310,7 @@ def zx_condition_at_positions(
     """
     if df.empty:
         return False
-    zxdq, zxdkx = compute_zx_lines(df)
+    zxdq, zxdkx = compute_zx_lines(df, m1=m1, m2=m2, m3=m3, m4=m4)
     if pos is None:
         pos = len(df) - 1
 
@@ -1063,11 +1069,10 @@ class BigBullishVolumeSelector:
 
 class ZXBrickTurnSelector:
     """
-    知行短期砖型图拐点（XG）选股器。
-    关键触发：
-      AA = REF(砖型图,1) < 砖型图
-      CC = REF(AA,1)=0 && AA=1
-      XG = CC>0
+    知行短期砖型图选股器（v2026 简化版）。
+    仅保留两条选股逻辑：
+    1) 收盘在黄线之上，白线在黄线之上。
+    2) T-1 绿砖、T 红砖，且红砖高度 >= strong_red_ratio * 绿砖高度。
     """
 
     def __init__(
@@ -1078,27 +1083,13 @@ class ZXBrickTurnSelector:
         var4_sma_n: int = 6,
         var5_sma_n: int = 6,
         brick_threshold: float = 4.0,
+        m1: int = 14,
+        m2: int = 28,
+        m3: int = 57,
+        m4: int = 114,
         min_history: int = 140,
         max_window: int = 180,
-        require_close_gt_long: bool = True,
-        require_short_gt_long: bool = True,
-        require_low_gt_long: bool = False,
-        max_close_to_short_mult: float | None = None,
-        max_low_to_short_mult: float | None = None,
-        require_brick_positive: bool = True,
-        min_brick_increase: float = 0.0,
-        apply_day_constraints: bool = False,
-        green_ratio_window: int = 6,
-        min_green_ratio: float = 2 / 3,
-        next_open_chase_pct_max: float | None = None,
-        allow_no_next_bar: bool = True,
-        require_prev_green: bool = True,
-        require_strong_red: bool = True,
         strong_red_ratio: float = 2 / 3,
-        require_pre_green_context: bool = True,
-        pre_turn_window: int = 3,
-        min_pre_green_ratio: float = 2 / 3,
-        require_recent_green_ratio: bool = True,
     ) -> None:
         if min_history < 20:
             raise ValueError("min_history 应 >= 20")
@@ -1108,77 +1099,39 @@ class ZXBrickTurnSelector:
             raise ValueError("max_window 应 >= min_history")
         if brick_threshold < 0:
             raise ValueError("brick_threshold 应 >= 0")
-        if min_brick_increase < 0:
-            raise ValueError("min_brick_increase 应 >= 0")
-        if green_ratio_window < 1:
-            raise ValueError("green_ratio_window 应 >= 1")
-        if not (0.0 <= min_green_ratio <= 1.0):
-            raise ValueError("min_green_ratio 应位于 [0,1]")
-        if next_open_chase_pct_max is not None and next_open_chase_pct_max < 0:
-            raise ValueError("next_open_chase_pct_max 应 >= 0")
-        if max_close_to_short_mult is not None and max_close_to_short_mult <= 0:
-            raise ValueError("max_close_to_short_mult 应 > 0")
-        if max_low_to_short_mult is not None and max_low_to_short_mult <= 0:
-            raise ValueError("max_low_to_short_mult 应 > 0")
+        if min(m1, m2, m3, m4) < 2:
+            raise ValueError("m1~m4 应 >= 2")
         if strong_red_ratio < 0:
             raise ValueError("strong_red_ratio 应 >= 0")
-        if pre_turn_window < 1:
-            raise ValueError("pre_turn_window 应 >= 1")
-        if not (0.0 <= min_pre_green_ratio <= 1.0):
-            raise ValueError("min_pre_green_ratio 应位于 [0,1]")
 
         self.brick_window = int(brick_window)
         self.var2_sma_n = int(var2_sma_n)
         self.var4_sma_n = int(var4_sma_n)
         self.var5_sma_n = int(var5_sma_n)
         self.brick_threshold = float(brick_threshold)
+        self.m1 = int(m1)
+        self.m2 = int(m2)
+        self.m3 = int(m3)
+        self.m4 = int(m4)
         self.min_history = int(min_history)
         self.max_window = int(max_window)
-        self.require_close_gt_long = bool(require_close_gt_long)
-        self.require_short_gt_long = bool(require_short_gt_long)
-        self.require_low_gt_long = bool(require_low_gt_long)
-        self.max_close_to_short_mult = (
-            None if max_close_to_short_mult is None else float(max_close_to_short_mult)
-        )
-        self.max_low_to_short_mult = (
-            None if max_low_to_short_mult is None else float(max_low_to_short_mult)
-        )
-        self.require_brick_positive = bool(require_brick_positive)
-        self.min_brick_increase = float(min_brick_increase)
-        self.apply_day_constraints = bool(apply_day_constraints)
-        self.green_ratio_window = int(green_ratio_window)
-        self.min_green_ratio = float(min_green_ratio)
-        self.next_open_chase_pct_max = (
-            None if next_open_chase_pct_max is None else float(next_open_chase_pct_max)
-        )
-        self.allow_no_next_bar = bool(allow_no_next_bar)
-        self.require_prev_green = bool(require_prev_green)
-        self.require_strong_red = bool(require_strong_red)
         self.strong_red_ratio = float(strong_red_ratio)
-        self.require_pre_green_context = bool(require_pre_green_context)
-        self.pre_turn_window = int(pre_turn_window)
-        self.min_pre_green_ratio = float(min_pre_green_ratio)
-        self.require_recent_green_ratio = bool(require_recent_green_ratio)
 
-    def _passes_filters(self, hist: pd.DataFrame, next_bar: pd.Series | None = None) -> bool:
+    def _passes_filters(self, hist: pd.DataFrame) -> bool:
         if hist is None or hist.empty:
             return False
         hist = hist.sort_values("date").copy()
         if len(hist) < self.min_history:
             return False
 
-        if self.apply_day_constraints and not passes_day_constraints_today(hist):
+        # 条件1：收盘 > 黄线，白线 > 黄线
+        zxdq, zxdkx = compute_zx_lines(hist, m1=self.m1, m2=self.m2, m3=self.m3, m4=self.m4)
+        c = float(hist["close"].iloc[-1])
+        s = float(zxdq.iloc[-1])
+        l = float(zxdkx.iloc[-1]) if pd.notna(zxdkx.iloc[-1]) else float("nan")
+        if not (np.isfinite(c) and np.isfinite(s) and np.isfinite(l)):
             return False
-
-        if not zx_condition_at_positions(
-            hist,
-            require_close_gt_long=self.require_close_gt_long,
-            require_short_gt_long=self.require_short_gt_long,
-            require_low_gt_long=self.require_low_gt_long,
-            max_close_to_short_mult=self.max_close_to_short_mult,
-            max_low_to_short_mult=self.max_low_to_short_mult,
-            pos=None,
-        ):
+        if not (c > l and s > l):
             return False
 
         brick_df = compute_brick_turn_signal(
@@ -1192,71 +1145,21 @@ class ZXBrickTurnSelector:
         if brick_df.empty:
             return False
 
-        if int(brick_df["xg"].iloc[-1]) <= 0:
+        # 条件2：T-1 绿砖，T 红砖
+        if len(brick_df) < 3:
+            return False
+        if not bool(brick_df["aa"].iloc[-1]):   # T 红砖
+            return False
+        if not bool(brick_df["bb"].iloc[-2]):   # T-1 绿砖
             return False
 
-        # 严格“绿转强红”：T-1 绿砖，T 红砖
-        if self.require_prev_green:
-            if len(brick_df) < 2:
-                return False
-            if not bool(brick_df["aa"].iloc[-1]):   # T 红砖
-                return False
-            if not bool(brick_df["bb"].iloc[-2]):   # T-1 绿砖
-                return False
-
-        # 转折上下文：T 之前窗口应以绿砖为主，避免把强趋势中继误判为“转折”
-        if self.require_pre_green_context:
-            if len(brick_df) < self.pre_turn_window + 1:
-                return False
-            pre_green = brick_df["bb"].iloc[-(self.pre_turn_window + 1):-1]
-            if len(pre_green) < self.pre_turn_window:
-                return False
-            pre_green_ratio = float(pre_green.astype(float).mean())
-            if pre_green_ratio < self.min_pre_green_ratio:
-                return False
-
-        # 强红：T 日红砖高度 >= strong_red_ratio * (T-1 日绿砖高度)
-        # 例如 strong_red_ratio=2/3：red/green >= 0.67
-        if self.require_strong_red:
-            if len(brick_df) < 3:
-                return False
-            red_height = float(brick_df["brick"].iloc[-1] - brick_df["brick"].iloc[-2])
-            green_height = float(brick_df["brick"].iloc[-3] - brick_df["brick"].iloc[-2])
-            if red_height <= 0 or green_height <= 0:
-                return False
-            if red_height < self.strong_red_ratio * green_height:
-                return False
-
-        brick_now = float(brick_df["brick"].iloc[-1])
-        brick_prev = float(brick_df["brick"].iloc[-2]) if len(brick_df) >= 2 else 0.0
-
-        if self.require_brick_positive and brick_now <= 0:
+        # 红砖高度 >= strong_red_ratio * 绿砖高度
+        red_height = float(brick_df["brick"].iloc[-1] - brick_df["brick"].iloc[-2])
+        green_height = float(brick_df["brick"].iloc[-3] - brick_df["brick"].iloc[-2])
+        if red_height <= 0 or green_height <= 0:
             return False
-        if (brick_now - brick_prev) < self.min_brick_increase:
+        if red_height < self.strong_red_ratio * green_height:
             return False
-
-        # 可选：最近窗口内绿柱(BB=True)占比过滤（默认开启，更符合“转折前走弱”语义）
-        # 口径：只看 T 之前窗口，不把当日 T 纳入统计。
-        if self.require_recent_green_ratio:
-            green_win = brick_df["bb"].iloc[-(self.green_ratio_window + 1):-1]
-            if len(green_win) < self.green_ratio_window:
-                return False
-            green_ratio = float(green_win.astype(float).mean())
-            if green_ratio < self.min_green_ratio:
-                return False
-
-        # 可选：次日早晨不追高（仅在有次日K线时生效）
-        if self.next_open_chase_pct_max is not None:
-            if next_bar is None:
-                if not self.allow_no_next_bar:
-                    return False
-            else:
-                o1 = float(next_bar.get("open", np.nan))
-                c0 = float(hist["close"].iloc[-1])
-                if not (np.isfinite(o1) and np.isfinite(c0) and o1 > 0 and c0 > 0):
-                    return False
-                if o1 > c0 * (1.0 + self.next_open_chase_pct_max):
-                    return False
 
         return True
 
@@ -1274,8 +1177,7 @@ class ZXBrickTurnSelector:
             hist = df_sorted.iloc[max(0, pos - need_len + 1): pos + 1]
             if len(hist) < self.min_history:
                 continue
-            next_bar = df_sorted.iloc[pos + 1] if (pos + 1) < len(df_sorted) else None
-            if self._passes_filters(hist, next_bar=next_bar):
+            if self._passes_filters(hist):
                 picks.append(code)
         return picks
 

@@ -29,6 +29,10 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("select")
+STOCKLIST_FIELDS = ["ts_code", "symbol", "name", "area", "industry"]
+STOCKINFO_COLUMNS = ["trade_date", "strategy_alias", "ts_code", "symbol", "name", "area", "industry"]
+DETAIL_COLUMNS = ["trade_date", "alias", "class", "rank", "code"]
+SUMMARY_COLUMNS = ["trade_date", "alias", "class", "count", "codes"]
 
 
 # ---------- 工具 ----------
@@ -67,6 +71,42 @@ def load_config(cfg_path: Path) -> List[Dict[str, Any]]:
     return cfgs
 
 
+def _normalize_symbol(code: str) -> str:
+    c = str(code).strip().upper()
+    return c.split(".")[0]
+
+
+def load_stock_meta(stocklist_path: Path) -> Dict[str, Dict[str, str]]:
+    """
+    从 stocklist.csv 读取股票静态信息，返回以 symbol(6位代码) 为键的映射。
+    """
+    if not stocklist_path.exists():
+        logger.warning("stocklist 文件不存在：%s，将输出空股票信息", stocklist_path)
+        return {}
+
+    try:
+        stock_df = pd.read_csv(stocklist_path, dtype=str).fillna("")
+    except Exception as e:
+        logger.warning("读取 stocklist 失败：%s；将输出空股票信息", e)
+        return {}
+
+    missing = [c for c in STOCKLIST_FIELDS if c not in stock_df.columns]
+    if missing:
+        logger.warning("stocklist 缺少字段 %s；将输出空股票信息", missing)
+        return {}
+
+    meta: Dict[str, Dict[str, str]] = {}
+    for _, row in stock_df.iterrows():
+        record = {k: str(row.get(k, "")).strip() for k in STOCKLIST_FIELDS}
+        symbol_key = _normalize_symbol(record["symbol"])
+        if symbol_key:
+            meta[symbol_key] = record
+        ts_key = _normalize_symbol(record["ts_code"])
+        if ts_key and ts_key not in meta:
+            meta[ts_key] = record
+    return meta
+
+
 def instantiate_selector(cfg: Dict[str, Any]):
     """动态加载 Selector 类并实例化"""
     cls_name: str = cfg.get("class")
@@ -88,6 +128,7 @@ def persist_selection_results(
     trade_date: pd.Timestamp,
     out_dir: Path,
     run_results: List[Dict[str, Any]],
+    stock_meta: Dict[str, Dict[str, str]],
 ) -> Dict[str, Path]:
     """
     将当次选股结果落盘：
@@ -103,6 +144,7 @@ def persist_selection_results(
     json_fp = out_dir / f"select_results_{date_tag}_{ts_tag}.json"
     summary_csv_fp = out_dir / f"select_results_summary_{date_tag}_{ts_tag}.csv"
     detail_csv_fp = out_dir / f"select_results_detail_{date_tag}_{ts_tag}.csv"
+    stockinfo_csv_fp = out_dir / f"select_results_stockinfo_{date_tag}_{ts_tag}.csv"
 
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -115,6 +157,7 @@ def persist_selection_results(
 
     summary_rows = []
     detail_rows = []
+    stockinfo_rows = []
     for item in run_results:
         picks = list(item.get("picks", []))
         summary_rows.append(
@@ -136,14 +179,29 @@ def persist_selection_results(
                     "code": code,
                 }
             )
+            code_key = _normalize_symbol(code)
+            info = stock_meta.get(code_key, {})
+            stockinfo_rows.append(
+                {
+                    "trade_date": str(trade_date.date()),
+                    "strategy_alias": item.get("alias", ""),
+                    "ts_code": info.get("ts_code", ""),
+                    "symbol": info.get("symbol", code_key),
+                    "name": info.get("name", ""),
+                    "area": info.get("area", ""),
+                    "industry": info.get("industry", ""),
+                }
+            )
 
-    pd.DataFrame(summary_rows).to_csv(summary_csv_fp, index=False, encoding="utf-8-sig")
-    pd.DataFrame(detail_rows).to_csv(detail_csv_fp, index=False, encoding="utf-8-sig")
+    pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS).to_csv(summary_csv_fp, index=False, encoding="utf-8-sig")
+    pd.DataFrame(detail_rows, columns=DETAIL_COLUMNS).to_csv(detail_csv_fp, index=False, encoding="utf-8-sig")
+    pd.DataFrame(stockinfo_rows, columns=STOCKINFO_COLUMNS).to_csv(stockinfo_csv_fp, index=False, encoding="utf-8-sig")
 
     return {
         "json": json_fp,
         "summary_csv": summary_csv_fp,
         "detail_csv": detail_csv_fp,
+        "stockinfo_csv": stockinfo_csv_fp,
     }
 
 
@@ -156,6 +214,7 @@ def main():
     p.add_argument("--date", help="交易日 YYYY-MM-DD；缺省=数据最新日期")
     p.add_argument("--tickers", default="all", help="'all' 或逗号分隔股票代码列表")
     p.add_argument("--out-dir", default="./out", help="结果落盘目录（默认 ./out）")
+    p.add_argument("--stocklist", default="./configs/stocklist.csv", help="股票信息 CSV（默认 ./configs/stocklist.csv）")
     args = p.parse_args()
 
     # --- 加载行情 ---
@@ -188,6 +247,7 @@ def main():
 
     # --- 加载 Selector 配置 ---
     selector_cfgs = load_config(Path(args.config))
+    stock_meta = load_stock_meta(Path(args.stocklist))
     run_results: List[Dict[str, Any]] = []
 
     # --- 逐个 Selector 运行 ---
@@ -222,12 +282,14 @@ def main():
         trade_date=trade_date,
         out_dir=Path(args.out_dir),
         run_results=run_results,
+        stock_meta=stock_meta,
     )
     logger.info("")
     logger.info("结果已落盘：")
     logger.info("JSON: %s", output_files["json"])
     logger.info("Summary CSV: %s", output_files["summary_csv"])
     logger.info("Detail CSV: %s", output_files["detail_csv"])
+    logger.info("StockInfo CSV: %s", output_files["stockinfo_csv"])
 
 
 if __name__ == "__main__":

@@ -232,7 +232,7 @@ python scripts/backtest_selectors.py \
 当前代码口径：
 
 - 前 6 个策略（`BBIKDJ / SuperB1 / BBIShortLong / PeakKDJ / MA60CrossVolumeWave / BigBullishVolume`）默认都会走“当日过滤 + 知行约束”；
-- `ZXBrickTurnSelector（搬砖战法）` 的当日过滤由 `apply_day_constraints` 控制（默认 `false`），知行条件由 `require_close_gt_long`、`require_short_gt_long` 控制。
+- `ZXBrickTurnSelector（搬砖战法）` 仅按 v2026 两条规则过滤：`close>黄线 && 白线>黄线`，以及 `T-1绿/T红且红砖>=2/3绿砖`。
 
 ---
 
@@ -455,25 +455,15 @@ python scripts/backtest_selectors.py \
 
 1. 按通达信公式计算短期“砖型图”动能：
    `VAR1A~VAR6A`，并定义 `砖型图 = IF(VAR6A>4, VAR6A-4, 0)`；
-2. 定义 `AA = REF(砖型图,1) < 砖型图`；
-3. 定义 `BB = REF(砖型图,1) > 砖型图`；
-4. 定义 `CC = REF(AA,1)=0 && AA=1`，即“由非增强切换到首次增强”；
-5. 策略默认采用严格“绿转强红”：
-   `T-1` 日满足 `BB`（绿砖），`T` 日满足 `AA`（红砖）；
-6. 策略默认要求“强红力度”：
-   `red_height(T) >= strong_red_ratio * green_height(T-1)`，默认 `strong_red_ratio=1.15`；
-   即当日红砖至少达到前一日绿砖的 1.15 倍。
-7. `XG = CC>0` 作为触发信号；
-8. 叠加知行趋势过滤（可配置）：
-   `close > 长期线` 与 `短期线 > 长期线`。
-9. 最近绿砖占比约束（默认开启）：
-   要求最近 `green_ratio_window` 日（不含当日）中
-   `BB = REF(砖型图,1) > 砖型图` 的占比 ≥ `min_green_ratio`；
-10. 转折前上下文要求（默认开启）：
-   在 `pre_turn_window` 个交易日内，绿砖占比 ≥ `min_pre_green_ratio`，避免强趋势中继误入选；
-11. 可选次日早盘不追高过滤（执行层规则，默认关闭）：
-   若配置 `next_open_chase_pct_max`，则要求次日开盘不高于当日收盘的对应比例上限；
-   当前默认 `null`，选股阶段不使用未来次日数据。
+2. 知行趋势过滤（v2026）：
+   `close > 黄线` 且 `白线 > 黄线`，
+   其中白线 `EMA(EMA(C,10),10)`，黄线 `(MA(C,M1)+MA(C,M2)+MA(C,M3)+MA(C,M4))/4`；
+3. 严格“绿转红强”（v2026）：
+   `T-1` 为绿砖、`T` 为红砖；
+4. 红砖力度：
+   `red_height(T) >= strong_red_ratio * green_height(T-1)`，
+   默认 `strong_red_ratio = 2/3`（红砖高度至少是绿砖的三分之二）；
+5. 不叠加其他附加过滤条件。
 
 `configs/configs.json` 预设：
 
@@ -488,27 +478,13 @@ python scripts/backtest_selectors.py \
     "var4_sma_n": 6,
     "var5_sma_n": 6,
     "brick_threshold": 4.0,
+    "m1": 14,
+    "m2": 28,
+    "m3": 57,
+    "m4": 114,
     "min_history": 140,
     "max_window": 180,
-    "require_close_gt_long": true,
-    "require_short_gt_long": true,
-    "require_low_gt_long": false,
-    "max_close_to_short_mult": 1.09,
-    "max_low_to_short_mult": 1.02,
-    "require_brick_positive": true,
-    "min_brick_increase": 0.5,
-    "apply_day_constraints": false,
-    "require_recent_green_ratio": true,
-    "green_ratio_window": 4,
-    "min_green_ratio": 0.75,
-    "next_open_chase_pct_max": null,
-    "allow_no_next_bar": true,
-    "require_prev_green": true,
-    "require_strong_red": true,
-    "strong_red_ratio": 1.15,
-    "require_pre_green_context": true,
-    "pre_turn_window": 5,
-    "min_pre_green_ratio": 0.6
+    "strong_red_ratio": 0.6666666667
   }
 }
 ```
@@ -609,16 +585,10 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[hist 输入] --> B[计算砖型图 VAR1A~VAR6A]
-    B --> C[计算 AA/BB/CC/XG]
-    C --> D[XG 当日触发]
-    D --> E[T-1 绿 T 红]
-    E --> F[前置绿砖上下文通过]
-    F --> G[强红力度 red>=ratio*green]
-    G --> H[最近绿砖占比通过]
-    H --> I[知行趋势过滤通过]
-    I --> J[可选 当日波动约束]
-    J --> K[可选 次日不追高]
-    K --> L[入选]
+    B --> C[知行过滤 close>黄线 且 白线>黄线]
+    C --> D[T-1 绿 T 红]
+    D --> E[强红 red>=2/3*green]
+    E --> F[入选]
 ```
 
 ---
